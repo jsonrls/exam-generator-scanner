@@ -1,0 +1,68 @@
+# PreBoard Exam Checker Mobile App
+
+Android app for importing question banks, generating pre-board exam sets, exporting printable PDFs, scanning answer sheets, and viewing records.
+
+## Project Structure
+
+- `app/` - Android application source code.
+- `app/src/main/java/com/pbec/preboardexamchecker/` - Kotlin source files.
+- `app/src/main/assets/katex/` - KaTeX assets used for math rendering.
+- `reference/` - Scanner/reference images.
+- `tools/` - Scanner calibration and validation scripts.
+- `INSTRUCTIONS.md` - Official exam blueprint tables.
+- `RUN.md` - Quick device install/run commands.
+
+## Build
+
+Run from this `mobile-app` directory:
+
+```bash
+./gradlew :app:compileDebugKotlin
+./gradlew :app:assembleDebug
+```
+
+Install and launch on a connected device:
+
+```bash
+./gradlew clean :app:installDebug
+adb shell monkey -p com.pbec.preboardexamchecker 1
+```
+
+Use a device id when multiple devices are connected:
+
+```bash
+adb -s <device-id> shell monkey -p com.pbec.preboardexamchecker 1
+```
+
+## Exam Generation
+
+Generated exams include two sets:
+
+- Set A and Set B contain the same selected questions.
+- Set A and Set B store separate shuffled question-id orders.
+- Exporting or viewing a set uses that set's stored order.
+
+## PDF Export Notes
+
+Question PDF export is optimized for less paper usage:
+
+- Compact 10pt body text.
+- Reduced spacing and page margins.
+- Question blocks request keep-together layout so choices do not split from the prompt when the block fits on a new page.
+- Subject header, `Instruction:`, and `Multiple Choice` are bold.
+- `Multiple Choice` is not italic.
+
+Math rendering support:
+
+- Preserves Unicode math symbols where font support exists.
+- Uses available fallback fonts such as Noto Math, Noto Symbols, STIX, and symbol fonts.
+- Supports superscript/subscript text and `^` / `_` notation in exported PDFs.
+- `.xlsx` imports preserve rich-text superscript/subscript formatting for question text and options.
+
+## Useful Checks
+
+```bash
+./gradlew :app:compileDebugKotlin
+```
+
+This is the fastest local check after Kotlin source changes.
