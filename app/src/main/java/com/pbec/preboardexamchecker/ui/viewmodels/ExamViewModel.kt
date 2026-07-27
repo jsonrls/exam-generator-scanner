@@ -61,7 +61,8 @@ class ExamViewModel @Inject constructor(
                     questionRepository.getQuestionsByQuestionBankIdsOnly(selectedQuestionBankIds)
                 }
                 
-                if (allQuestions.isEmpty()) {
+                val uniqueQuestions = deduplicateQuestions(allQuestions)
+                if (uniqueQuestions.isEmpty()) {
                     _message.value = "No questions available in the selected question banks."
                     return@launch
                 }
@@ -70,20 +71,27 @@ class ExamViewModel @Inject constructor(
                 val useBlueprint = blueprint != null && numQuestions == 100
 
                 var selectedQuestions = if (useBlueprint) {
-                    generateFromBlueprint(allQuestions, blueprint!!)
+                    generateFromBlueprint(uniqueQuestions, blueprint!!)
                 } else {
                     emptyList()
                 }
 
                 var usedRandomFallback = false
                 if (selectedQuestions.isEmpty() && numQuestions > 0) {
-                    selectedQuestions = allQuestions.shuffled().take(minOf(numQuestions, allQuestions.size))
+                    selectedQuestions = uniqueQuestions.shuffled().take(minOf(numQuestions, uniqueQuestions.size))
                     usedRandomFallback = useBlueprint
                 } else if (useBlueprint && selectedQuestions.size < 100) {
                     val missing = 100 - selectedQuestions.size
-                    val remainingPool = allQuestions.filter { q -> selectedQuestions.none { it.id == q.id } }
+                    val selectedKeys = selectedQuestions.map(::questionUniquenessKey).toSet()
+                    val remainingPool = uniqueQuestions.filter { q -> questionUniquenessKey(q) !in selectedKeys }
                     selectedQuestions = selectedQuestions + remainingPool.shuffled().take(minOf(missing, remainingPool.size))
                     usedRandomFallback = true
+                }
+                selectedQuestions = deduplicateQuestions(selectedQuestions).take(numQuestions)
+
+                if (selectedQuestions.isEmpty()) {
+                    _message.value = "No unique questions available in the selected question banks."
+                    return@launch
                 }
 
                 val examName = "Exam ${exams.value.size + 1} (${subject})"
@@ -175,6 +183,26 @@ class ExamViewModel @Inject constructor(
         }
         
         return selected
+    }
+
+    private fun deduplicateQuestions(questions: List<Question>): List<Question> {
+        val seen = mutableSetOf<String>()
+        return questions.filter { question ->
+            seen.add(questionUniquenessKey(question))
+        }
+    }
+
+    private fun questionUniquenessKey(question: Question): String {
+        val normalizedText = question.questionText
+            .lowercase(Locale.ROOT)
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        return if (normalizedText.isNotBlank()) {
+            "${question.subject.lowercase(Locale.ROOT)}|$normalizedText"
+        } else {
+            "id:${question.id}"
+        }
     }
 
     /** Delete the exam definition only. Existing scan records are kept (they remain visible in
