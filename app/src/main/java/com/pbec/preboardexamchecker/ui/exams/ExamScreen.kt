@@ -63,6 +63,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.pbec.preboardexamchecker.data.models.Exam
 import com.pbec.preboardexamchecker.ui.Screen
+import com.pbec.preboardexamchecker.ui.components.DeleteConfirmationDialog
+import com.pbec.preboardexamchecker.ui.components.DeleteDialogAction
 import com.pbec.preboardexamchecker.ui.exambank.ExamBankContent
 import com.pbec.preboardexamchecker.ui.viewmodels.ExamBankViewModel
 import kotlinx.coroutines.launch
@@ -518,42 +520,32 @@ fun ExamScreen(
         }
 
         if (showDeleteConfirmationDialog) {
-            AlertDialog(
-                onDismissRequest = { showDeleteConfirmationDialog = false },
-                title = { Text("Delete exam") },
-                text = {
-                    Text(
-                        "Delete '${examToDelete?.examName}'?\n\n" +
-                            "• Delete exam only — keeps the records of students who already took it.\n" +
-                            "• Delete exam & records — also moves those records to the Trash (restorable for 30 days)."
-                    )
+            DeleteConfirmationDialog(
+                title = "Delete ${examToDelete?.examName ?: "exam"}?",
+                message = "Choose whether to keep existing student records or move those records to Trash with the exam.",
+                onDismiss = {
+                    showDeleteConfirmationDialog = false
+                    examToDelete = null
                 },
-                confirmButton = {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TextButton(onClick = {
-                            examToDelete?.let { viewModel.deleteExam(it) }
-                            showDeleteConfirmationDialog = false
-                            examToDelete = null
-                        }) {
-                            Text("Exam only")
-                        }
-                        Button(onClick = {
+                actions = listOf(
+                    DeleteDialogAction(
+                        label = "Delete exam & records",
+                        onClick = {
                             examToDelete?.let { viewModel.deleteExamWithRecords(it) }
                             showDeleteConfirmationDialog = false
                             examToDelete = null
-                        }) {
-                            Text("Exam & records")
-                        }
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = {
-                        showDeleteConfirmationDialog = false
-                        examToDelete = null
-                    }) {
-                        Text("Cancel")
-                    }
-                }
+                        },
+                    ),
+                    DeleteDialogAction(
+                        label = "Delete exam only",
+                        destructive = false,
+                        onClick = {
+                            examToDelete?.let { viewModel.deleteExam(it) }
+                            showDeleteConfirmationDialog = false
+                            examToDelete = null
+                        },
+                    ),
+                ),
             )
         }
 

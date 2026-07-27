@@ -27,6 +27,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.pbec.preboardexamchecker.data.models.Question
 import com.pbec.preboardexamchecker.ui.Screen
+import com.pbec.preboardexamchecker.ui.components.DeleteConfirmationDialog
+import com.pbec.preboardexamchecker.ui.components.DeleteDialogAction
 import com.pbec.preboardexamchecker.ui.exams.OptionRowInBank
 import com.pbec.preboardexamchecker.ui.viewmodels.ExamBankViewModel
 import com.pbec.preboardexamchecker.utils.ExcelParser
@@ -476,45 +478,32 @@ fun ExamBankContent(
         }
 
         if (showImportSessionDeleteConfirmationDialog) {
-            AlertDialog(
-                onDismissRequest = { showImportSessionDeleteConfirmationDialog = false },
-                title = { Text("Confirm Session Deletion") },
-                text = {
-                    val baseText = "Are you sure you want to delete all questions from '${importSessionToDeleteName}'? This action cannot be undone."
-                    val additionalText = if (willBankBeEmptyAfterSessionDeletion) {
-                        "\n\nWarning: This action will make the entire exam bank empty for this subject!"
-                    } else {
-                        ""
-                    }
-                    val generatedExamWarning = if (generatedExamCountToDelete > 0) {
-                        "\n\nWarning: This bank is used by $generatedExamCountToDelete generated exam(s). Deleting this bank will also delete those generated exam(s)."
-                    } else {
-                        ""
-                    }
-                    Text(baseText + additionalText + generatedExamWarning)
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            importSessionToDeleteId?.let { id -> viewModel.deleteQuestionsForImportSession(id) }
-                            showImportSessionDeleteConfirmationDialog = false
-                            importSessionToDeleteId = null
-                            importSessionToDeleteName = null
-                            willBankBeEmptyAfterSessionDeletion = false
-                            generatedExamCountToDelete = 0
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                    ) { Text("Delete All") }
-                },
-                dismissButton = {
-                    Button(onClick = {
-                        showImportSessionDeleteConfirmationDialog = false
-                        importSessionToDeleteId = null
-                        importSessionToDeleteName = null
-                        willBankBeEmptyAfterSessionDeletion = false
-                        generatedExamCountToDelete = 0
-                    }) { Text("Cancel") }
+            val warningText = buildString {
+                append("This will move all questions from '${importSessionToDeleteName ?: "this bank"}' to Trash.")
+                if (willBankBeEmptyAfterSessionDeletion) {
+                    append("\n\nThis is the last set in the subject, so the question bank will become empty.")
                 }
+                if (generatedExamCountToDelete > 0) {
+                    append("\n\n$generatedExamCountToDelete generated exam(s) linked to this bank will also be moved to Trash.")
+                }
+            }
+            fun resetDeleteSessionDialog() {
+                showImportSessionDeleteConfirmationDialog = false
+                importSessionToDeleteId = null
+                importSessionToDeleteName = null
+                willBankBeEmptyAfterSessionDeletion = false
+                generatedExamCountToDelete = 0
+            }
+            DeleteConfirmationDialog(
+                title = "Delete question bank?",
+                message = warningText,
+                onDismiss = { resetDeleteSessionDialog() },
+                actions = listOf(
+                    DeleteDialogAction(label = "Delete question bank", onClick = {
+                        importSessionToDeleteId?.let { id -> viewModel.deleteQuestionsForImportSession(id) }
+                        resetDeleteSessionDialog()
+                    }),
+                ),
             )
         }
 

@@ -19,7 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -346,7 +346,7 @@ fun App(
 /**
  * The bottom-nav "Capture" button. Two looks:
  *
- *  - **Outside a session** — the default primary circle with a Search icon (the
+ *  - **Outside a session** — the default primary circle with a scanner icon (the
  *    caller also shows the "Capture" label).
  *  - **During a session** ([sessionActive]) — a camera-style white capture circle
  *    wrapped with a stability-countdown arc that fills clockwise from the top as the
@@ -366,7 +366,7 @@ private fun CaptureNavIcon(progress: Float, sessionActive: Boolean) {
             contentAlignment = Alignment.Center
         ) {
             Icon(
-                imageVector = Icons.Default.Search,
+                imageVector = Icons.Default.DocumentScanner,
                 contentDescription = "Capture",
                 modifier = Modifier.size(24.dp),
                 tint = MaterialTheme.colorScheme.onPrimary

@@ -2,6 +2,7 @@ package com.pbec.preboardexamchecker.data.models
 
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
+import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.ServerTimestamp
 
 data class Student(
@@ -12,6 +13,8 @@ data class Student(
     val program: String = "",
     val yearLevel: String = "",
     val block: String = "",
+    // Web-created roster rows use "section"; mobile uses "block". Keep both readable.
+    val section: String = "",
     // Roster-only fields. block is looked up by scanned Student ID (never on the answer sheet);
     // schoolYear distinguishes rosters imported across batches and is a Students/Records filter.
     val gender: String = "",
@@ -29,6 +32,12 @@ data class Student(
     // Set to the importId when trashed as a whole import; null when deleted individually. Splits the
     // Trash > Rosters tab into "Imports" vs "Individual students".
     val deletedBatch: Long? = null,
+    val isArchived: Boolean = false,
     @ServerTimestamp
     val createdAt: Timestamp? = null
 )
+
+fun DocumentSnapshot.toStudentCompat(): Student? {
+    val student = toObject(Student::class.java) ?: return null
+    return student.copy(block = student.block.ifBlank { student.section })
+}

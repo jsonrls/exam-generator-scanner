@@ -9,6 +9,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.pbec.preboardexamchecker.data.models.ExamCluster
 import com.pbec.preboardexamchecker.data.models.Student
+import com.pbec.preboardexamchecker.data.models.toStudentCompat
 import com.pbec.preboardexamchecker.data.repository.ExamClusterRepository
 import com.pbec.preboardexamchecker.data.repository.IScanResultRepository
 import com.pbec.preboardexamchecker.domain.excel.PreboardRecordExcelGenerator
@@ -154,10 +155,9 @@ class StudentsViewModel @Inject constructor(
         }
 
         _isLoading.value = true
-        // No orderBy: whereEqualTo + orderBy on different fields needs a composite index.
-        // Sorted client-side below instead.
+        // Read the collection and filter client-side so legacy web-created roster rows without
+        // uploadedByUid still appear. New mobile rows remain owner-tagged.
         firestore.collection("students")
-            .whereEqualTo("uploadedByUid", currentUser.uid)
             .addSnapshotListener { snapshot, error ->
                 _isLoading.value = false
                 if (error != null) {
@@ -172,8 +172,13 @@ class StudentsViewModel @Inject constructor(
 
                 if (snapshot != null) {
                     // Hide trashed rosters; they live in the Trash screen until restored or purged.
-                    _students.value = snapshot.toObjects(Student::class.java)
-                        .filter { it.deletedAt == null }
+                    _students.value = snapshot.documents
+                        .mapNotNull { it.toStudentCompat() }
+                        .filter {
+                            (it.uploadedByUid.isBlank() || it.uploadedByUid == currentUser.uid) &&
+                                it.deletedAt == null &&
+                                !it.isArchived
+                        }
                         .sortedBy { it.name.lowercase() }
                 }
             }
@@ -230,9 +235,12 @@ class StudentsViewModel @Inject constructor(
             }
             try {
                 // One existing-doc lookup, so we upsert without a query per student.
-                val existing = firestore.collection("students")
-                    .whereEqualTo("uploadedByUid", uid).get().await()
+                val existing = firestore.collection("students").get().await()
                 val byStudentId = existing.documents
+                    .filter {
+                        val owner = it.getString("uploadedByUid").orEmpty()
+                        owner.isBlank() || owner == uid
+                    }
                     .mapNotNull { d -> d.getString("studentId")?.let { it to d.reference } }
                     .toMap()
 
@@ -255,6 +263,7 @@ class StudentsViewModel @Inject constructor(
                         "name" to rs.name,
                         "studentId" to rs.studentId,
                         "block" to rs.block,
+                        "section" to rs.block,
                         "email" to rs.email,
                         "program" to rs.program,
                         "yearLevel" to "4",
@@ -390,6 +399,7 @@ class StudentsViewModel @Inject constructor(
             "program" to program,
             "yearLevel" to yearLevel,
             "block" to block,
+            "section" to block,
             "email" to email,
             "uploadedByUid" to (uid ?: ""),
             "createdAt" to com.google.firebase.Timestamp.now()
@@ -412,6 +422,7 @@ class StudentsViewModel @Inject constructor(
             "program" to program,
             "yearLevel" to yearLevel,
             "block" to block,
+            "section" to block,
             "email" to email
         )
 

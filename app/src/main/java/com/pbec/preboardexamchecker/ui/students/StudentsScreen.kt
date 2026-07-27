@@ -7,6 +7,8 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -33,6 +35,8 @@ import androidx.navigation.NavController
 import com.pbec.preboardexamchecker.data.models.ExamCluster
 import com.pbec.preboardexamchecker.data.models.Student
 import com.pbec.preboardexamchecker.ui.Screen
+import com.pbec.preboardexamchecker.ui.components.DeleteConfirmationDialog
+import com.pbec.preboardexamchecker.ui.components.DeleteDialogAction
 import com.pbec.preboardexamchecker.ui.theme.BrandTopAppBar
 import kotlinx.coroutines.flow.collectLatest
 
@@ -79,6 +83,7 @@ fun StudentsScreen(
     var showAddEditDialog by remember { mutableStateOf(false) }
     var editingStudent by remember { mutableStateOf<Student?>(null) }
     var showDeleteSelected by remember { mutableStateOf(false) }
+    var studentDeleteTarget by remember { mutableStateOf<Student?>(null) }
     var filtersExpanded by rememberSaveable { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var showDeleteImport by remember { mutableStateOf(false) }
@@ -230,16 +235,17 @@ fun StudentsScreen(
     }
 
     if (showDeleteSelected) {
-        AlertDialog(
-            onDismissRequest = { showDeleteSelected = false },
-            title = { Text("Delete ${selectedIds.size} student${if (selectedIds.size == 1) "" else "s"}") },
-            text = { Text("Move them to Trash? You can restore them within 30 days.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    viewModel.deleteStudents(selectedIds.toSet()); showDeleteSelected = false; clearSelection()
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = { TextButton(onClick = { showDeleteSelected = false }) { Text("Cancel") } },
+        DeleteConfirmationDialog(
+            title = "Move ${selectedIds.size} student${if (selectedIds.size == 1) "" else "s"} to Trash?",
+            message = "These roster entries will be hidden from Students and can be restored from Trash within 30 days.",
+            onDismiss = { showDeleteSelected = false },
+            actions = listOf(
+                DeleteDialogAction(label = "Move to Trash", onClick = {
+                    viewModel.deleteStudents(selectedIds.toSet())
+                    showDeleteSelected = false
+                    clearSelection()
+                }),
+            ),
         )
     }
 
@@ -289,7 +295,7 @@ fun StudentsScreen(
     }
 
     if (showAddEditDialog) {
-        AddEditStudentDialog(
+        AddEditStudentSheet(
             student = editingStudent,
             onDismiss = { showAddEditDialog = false },
             onConfirm = { name, sid, prog, year, sect, email ->
@@ -299,9 +305,24 @@ fun StudentsScreen(
                 showAddEditDialog = false
             },
             onDelete = {
-                editingStudent?.let { viewModel.deleteStudent(it.id) }
-                showAddEditDialog = false
+                editingStudent?.let { studentDeleteTarget = it }
             },
+        )
+    }
+
+    studentDeleteTarget?.let { student ->
+        DeleteConfirmationDialog(
+            title = "Move ${student.name.ifBlank { "this student" }} to Trash?",
+            message = "The student will be removed from the active roster and can be restored from Trash within 30 days.",
+            onDismiss = { studentDeleteTarget = null },
+            actions = listOf(
+                DeleteDialogAction(label = "Move to Trash", onClick = {
+                    viewModel.deleteStudent(student.id)
+                    studentDeleteTarget = null
+                    showAddEditDialog = false
+                    editingStudent = null
+                }),
+            ),
         )
     }
 }
@@ -553,7 +574,7 @@ fun EmptyListPlaceholder(modifier: Modifier, isSearching: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddEditStudentDialog(
+fun AddEditStudentSheet(
     student: Student?,
     onDismiss: () -> Unit,
     onConfirm: (String, String, String, String, String, String) -> Unit,
@@ -565,17 +586,57 @@ fun AddEditStudentDialog(
     var yearLevel by remember { mutableStateOf(student?.yearLevel ?: "") }
     var block by remember { mutableStateOf(student?.block ?: "") }
     var email by remember { mutableStateOf(student?.email ?: "") }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val canSave = name.isNotBlank() && studentId.isNotBlank()
 
-    AlertDialog(
+    ModalBottomSheet(
         onDismissRequest = onDismiss,
-        title = { Text(if (student == null) "Add Student" else "Edit Student") },
-        text = {
-            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = studentId, onValueChange = { studentId = it }, label = { Text("Student ID") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = program, onValueChange = { program = it }, label = { Text("Program") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = yearLevel, onValueChange = { yearLevel = it }, label = { Text("Year Level") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = block, onValueChange = { block = it }, label = { Text("Block") }, modifier = Modifier.fillMaxWidth())
+        sheetState = sheetState,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = if (student == null) "Add Student" else "Edit Student",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = if (student == null) "Create a roster entry" else "Update roster details",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Default.Close, contentDescription = "Close")
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Full Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = studentId, onValueChange = { studentId = it }, label = { Text("Student ID") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = program, onValueChange = { program = it }, label = { Text("Program") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(value = yearLevel, onValueChange = { yearLevel = it }, label = { Text("Year Level") }, singleLine = true, modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = block, onValueChange = { block = it }, label = { Text("Block") }, singleLine = true, modifier = Modifier.weight(1f))
+                }
                 OutlinedTextField(
                     value = email,
                     onValueChange = { email = it },
@@ -585,21 +646,40 @@ fun AddEditStudentDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
-        },
-        confirmButton = {
-            Button(onClick = { onConfirm(name, studentId, program, yearLevel, block, email.trim()) }, enabled = name.isNotBlank() && studentId.isNotBlank()) {
-                Text("Save")
+
+            HorizontalDivider()
+
+            Button(
+                onClick = { onConfirm(name, studentId, program, yearLevel, block, email.trim()) },
+                enabled = canSave,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+            ) {
+                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(if (student == null) "Add Student" else "Save Changes")
             }
-        },
-        dismissButton = {
-            Row {
-                if (student != null) {
-                    IconButton(onClick = onDelete) {
-                        Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
-                    }
+
+            OutlinedButton(
+                onClick = onDismiss,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+            ) {
+                Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Cancel")
+            }
+
+            if (student != null) {
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+                OutlinedButton(
+                    onClick = onDelete,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) {
+                    Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Move to Trash")
                 }
-                TextButton(onClick = onDismiss) { Text("Cancel") }
             }
-        },
-    )
+        }
+    }
 }

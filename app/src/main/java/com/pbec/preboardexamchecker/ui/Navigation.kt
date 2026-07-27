@@ -2,14 +2,13 @@ package com.pbec.preboardexamchecker.ui
 
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.FactCheck
 import androidx.compose.material.icons.automirrored.filled.List 
-import androidx.compose.material.icons.filled.AccountCircle 
 import androidx.compose.material.icons.filled.Home 
-import androidx.compose.material.icons.filled.Search 
-
- 
-import androidx.compose.material.icons.filled.Download 
+import androidx.compose.material.icons.filled.DocumentScanner 
 import androidx.compose.material.icons.filled.Description 
+import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.UploadFile
 
 import androidx.compose.material3.Icon
@@ -75,7 +74,7 @@ sealed interface Screen {
         override val route = "students"
         override val title = "Students"
         override val icon: @Composable () -> Unit = {
-            Icon(Icons.AutoMirrored.Filled.List, contentDescription = "Students", modifier = Modifier.size(24.dp))
+            Icon(Icons.Filled.Groups, contentDescription = "Students", modifier = Modifier.size(24.dp))
         }
     }
 
@@ -84,7 +83,7 @@ sealed interface Screen {
         override val title = "Capture"
         override val icon: @Composable () -> Unit = {
             Icon(
-                Icons.Filled.Search,  
+                Icons.Filled.DocumentScanner,
                 contentDescription = "Capture",
                 modifier = Modifier.size(24.dp)
             )
@@ -95,7 +94,7 @@ sealed interface Screen {
         override val route = "records"
         override val title = "Records"
         override val icon: @Composable () -> Unit = {
-            Icon(Icons.AutoMirrored.Filled.List, contentDescription = "Records", modifier = Modifier.size(24.dp))
+            Icon(Icons.AutoMirrored.Filled.FactCheck, contentDescription = "Records", modifier = Modifier.size(24.dp))
         }
     }
 
@@ -103,7 +102,7 @@ sealed interface Screen {
         override val route = "account"
         override val title = "Settings"
         override val icon: @Composable () -> Unit = {
-            Icon(Icons.Filled.AccountCircle, contentDescription = "Settings", modifier = Modifier.size(24.dp))
+            Icon(Icons.Filled.Settings, contentDescription = "Settings", modifier = Modifier.size(24.dp))
         }
     }
 
