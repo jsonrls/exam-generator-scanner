@@ -8,6 +8,7 @@ import org.apache.poi.ss.usermodel.Cell
 import org.apache.poi.ss.usermodel.CellType
 import org.apache.poi.ss.usermodel.DataFormatter
 import org.apache.poi.ss.usermodel.Font
+import org.apache.poi.ss.usermodel.FormulaEvaluator
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import org.apache.poi.xssf.usermodel.XSSFRichTextString
 import java.io.BufferedReader
@@ -55,6 +56,7 @@ class ExcelParser @Inject constructor() {
         context.contentResolver.openInputStream(uri)?.use { inputStream ->
             XSSFWorkbook(inputStream).use { workbook ->
             val dataFormatter = DataFormatter()
+            val formulaEvaluator = workbook.creationHelper.createFormulaEvaluator()
 
             for (sheetIndex in 0 until workbook.numberOfSheets) {
                 val sheet = workbook.getSheetAt(sheetIndex)
@@ -68,7 +70,9 @@ class ExcelParser @Inject constructor() {
                 val currentHeaders = mutableMapOf<String, Int>()
                 for (cellIndex in 0 until headerRow.lastCellNum.toInt()) {
                     val cell = headerRow.getCell(cellIndex) ?: continue
-                    val cellValue = dataFormatter.formatCellValue(cell).trim().lowercase(Locale.ROOT)
+                    val cellValue = formattedCellValue(cell, dataFormatter, formulaEvaluator)
+                        .trim()
+                        .lowercase(Locale.ROOT)
                     if (cellValue.isNotEmpty()) {
                         currentHeaders[cellValue] = cellIndex
                     }
@@ -80,20 +84,20 @@ class ExcelParser @Inject constructor() {
                     for (i in 1..sheet.lastRowNum) {
                         val row = sheet.getRow(i) ?: continue
                         val qTextIdx = colMapping["question text"]!!
-                        val questionText = formattedCellText(row.getCell(qTextIdx), dataFormatter).trim()
+                        val questionText = formattedCellText(row.getCell(qTextIdx), dataFormatter, formulaEvaluator).trim()
                         if (questionText.isBlank()) continue
 
                         val questionNumber = try {
                             if (colMapping.containsKey("number")) {
                                 val cell = row.getCell(colMapping["number"]!!)
-                                dataFormatter.formatCellValue(cell).toDouble().toInt()
+                                formattedCellValue(cell, dataFormatter, formulaEvaluator).toDouble().toInt()
                             } else {
                                 i
                             }
                         } catch (_: Exception) { i }
 
                         var rawTopic = if (colMapping.containsKey("topic")) {
-                            dataFormatter.formatCellValue(row.getCell(colMapping["topic"]!!)).trim()
+                            formattedCellValue(row.getCell(colMapping["topic"]!!), dataFormatter, formulaEvaluator).trim()
                         } else {
                             ""
                         }
@@ -104,7 +108,7 @@ class ExcelParser @Inject constructor() {
                         }
 
                         var rawCategory = if (colMapping.containsKey("category")) {
-                            dataFormatter.formatCellValue(row.getCell(colMapping["category"]!!)).trim()
+                            formattedCellValue(row.getCell(colMapping["category"]!!), dataFormatter, formulaEvaluator).trim()
                         } else {
                             null
                         }
@@ -123,11 +127,15 @@ class ExcelParser @Inject constructor() {
                                 topic = rawTopic,
                                 questionNumber = questionNumber,
                                 questionText = questionText,
-                                optionA = formattedCellText(row.getCell(colMapping["option a"]!!), dataFormatter).trim(),
-                                optionB = formattedCellText(row.getCell(colMapping["option b"]!!), dataFormatter).trim(),
-                                optionC = formattedCellText(row.getCell(colMapping["option c"]!!), dataFormatter).trim(),
-                                optionD = formattedCellText(row.getCell(colMapping["option d"]!!), dataFormatter).trim(),
-                                correctAnswer = dataFormatter.formatCellValue(row.getCell(colMapping["correct answer"]!!)).trim().uppercase(Locale.ROOT)
+                                optionA = formattedCellText(row.getCell(colMapping["option a"]!!), dataFormatter, formulaEvaluator).trim(),
+                                optionB = formattedCellText(row.getCell(colMapping["option b"]!!), dataFormatter, formulaEvaluator).trim(),
+                                optionC = formattedCellText(row.getCell(colMapping["option c"]!!), dataFormatter, formulaEvaluator).trim(),
+                                optionD = formattedCellText(row.getCell(colMapping["option d"]!!), dataFormatter, formulaEvaluator).trim(),
+                                correctAnswer = formattedCellValue(
+                                    row.getCell(colMapping["correct answer"]!!),
+                                    dataFormatter,
+                                    formulaEvaluator,
+                                ).trim().uppercase(Locale.ROOT)
                             )
                         )
                     }
@@ -166,9 +174,13 @@ class ExcelParser @Inject constructor() {
         return false
     }
 
-    private fun formattedCellText(cell: Cell?, dataFormatter: DataFormatter): String {
+    internal fun formattedCellText(
+        cell: Cell?,
+        dataFormatter: DataFormatter,
+        formulaEvaluator: FormulaEvaluator? = null,
+    ): String {
         if (cell == null) return ""
-        val formatted = dataFormatter.formatCellValue(cell)
+        val formatted = formattedCellValue(cell, dataFormatter, formulaEvaluator)
         if (cell.cellType != CellType.STRING) return formatted
 
         val richText = cell.richStringCellValue as? XSSFRichTextString ?: return formatted
@@ -200,6 +212,22 @@ class ExcelParser @Inject constructor() {
         }
 
         return output.toString().ifBlank { formatted }
+    }
+
+    private fun formattedCellValue(
+        cell: Cell?,
+        dataFormatter: DataFormatter,
+        formulaEvaluator: FormulaEvaluator?,
+    ): String {
+        if (cell == null) return ""
+        return runCatching {
+            if (formulaEvaluator == null) dataFormatter.formatCellValue(cell)
+            else dataFormatter.formatCellValue(cell, formulaEvaluator)
+        }.getOrElse {
+            // Some imported workbooks use functions Apache POI cannot evaluate. Preserve the
+            // cached/displayed value (or formula text) instead of dropping the cell entirely.
+            dataFormatter.formatCellValue(cell)
+        }
     }
 
     private fun toSuperscriptText(text: String): String {

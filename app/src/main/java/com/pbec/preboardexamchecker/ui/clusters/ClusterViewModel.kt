@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.Date
@@ -26,8 +27,12 @@ class ClusterViewModel @Inject constructor(
     /** Canonical subject order — same source the GWA weights and exports use. */
     val subjects: List<String> = ReportPdfStyle.subjectOrder
 
+    private val _clustersLoaded = MutableStateFlow(false)
+    val clustersLoaded: StateFlow<Boolean> = _clustersLoaded.asStateFlow()
+
     val clusters: StateFlow<List<ExamCluster>> =
         clusterRepository.observeClusters()
+            .onEach { _clustersLoaded.value = true }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /** Picker source for the create/edit dialog; also resolves examId -> name for the list. */

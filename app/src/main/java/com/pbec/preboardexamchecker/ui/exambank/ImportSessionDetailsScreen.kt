@@ -39,7 +39,11 @@ fun ImportSessionDetailsScreen(
         if (isShuffled) originalQuestions.shuffled() else originalQuestions
     }
     
-    val sessionName = originalQuestions.firstOrNull()?.fileName ?: "Imported Questions"
+    val sessionName = if (viewModel.isDefaultBankId(questionBankId)) {
+        "Default Question Bank"
+    } else {
+        originalQuestions.firstOrNull()?.fileName ?: "Imported Questions"
+    }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val focusManager = LocalFocusManager.current
@@ -114,6 +118,7 @@ fun ImportSessionDetailsScreen(
                     }
 
                     items(questions, key = { it.id }) { question ->
+                        val canModify = viewModel.canModifyQuestion(question)
                         val isCurrentlyBeingEdited = currentlyEditingQuestionId == question.id
                         var currentQuestionState by remember(question.id) {
                             mutableStateOf(localQuestionChanges[question.id] ?: question)
@@ -152,7 +157,7 @@ fun ImportSessionDetailsScreen(
                                     )
                                 }
 
-                                Row {
+                                if (canModify) Row {
                                     IconButton(onClick = {
                                         if (isCurrentlyBeingEdited) {
                                             val validation = viewModel.validateQuestion(currentQuestionState)
@@ -179,6 +184,12 @@ fun ImportSessionDetailsScreen(
                                     }) {
                                         Icon(Icons.Default.Delete, contentDescription = "Delete")
                                     }
+                                } else {
+                                    Text(
+                                        text = "Default",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
                                 }
                             }
 
@@ -203,7 +214,7 @@ fun ImportSessionDetailsScreen(
                                 if (isCurrentlyBeingEdited) {
                                     OutlinedTextField(value = currentQuestionState.optionA, onValueChange = { onValueChange(currentQuestionState.copy(optionA = it)) }, label = { Text("Option A") }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
                                     OutlinedTextField(value = currentQuestionState.optionB, onValueChange = { onValueChange(currentQuestionState.copy(optionB = it)) }, label = { Text("Option B") }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
-                                    OutlinedTextField(value = currentQuestionState.optionC, onValueChange = { onValueChange(currentQuestionState.copy(topic = it)) }, label = { Text("Option C") }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
+                                    OutlinedTextField(value = currentQuestionState.optionC, onValueChange = { onValueChange(currentQuestionState.copy(optionC = it)) }, label = { Text("Option C") }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
                                     OutlinedTextField(value = currentQuestionState.optionD, onValueChange = { onValueChange(currentQuestionState.copy(optionD = it)) }, label = { Text("Option D") }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
                                     OutlinedTextField(value = currentQuestionState.correctAnswer ?: "", onValueChange = { onValueChange(currentQuestionState.copy(correctAnswer = it.uppercase())) }, label = { Text("Correct Answer") }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp))
                                 } else {

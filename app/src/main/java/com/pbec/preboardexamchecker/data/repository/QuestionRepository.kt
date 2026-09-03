@@ -13,8 +13,8 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -27,148 +27,188 @@ class QuestionRepository @Inject constructor(
     companion object {
         private const val QUESTION_BANKS_COLLECTION = "question_banks"
         private const val QUESTIONS_SUBCOLLECTION = "questions"
+        private const val DEFAULT_BANK_PREFIX = "default_"
+        private val QUESTION_WHITESPACE = Regex("\\s+")
+
+        fun defaultQuestionBankId(subject: String): String = DEFAULT_BANK_PREFIX +
+            subject.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_')
+
+        fun isDefaultQuestionBankId(questionBankId: String): Boolean =
+            questionBankId.startsWith(DEFAULT_BANK_PREFIX)
     }
 
-    suspend fun insertQuestions(questions: List<Question>) {
-        if (questions.isEmpty()) return
-        val uid = ensureFirebaseUserUid()
-        val teacherId = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-            .getString("teacher_id", null)
-            ?: uid
+    suspend fun insertQuestions(questions: List<Question>): Int {
+        if (questions.isEmpty()) return 0
+        require(questions.none { it.isDefault }) { "Default questions are read-only." }
+        val owner = currentOwner()
+        var totalWritten = 0
 
-        questions.groupBy { it.questionBankId }.forEach { (bankId, groupedQuestions) ->
+        questions.groupBy { it.subject }.forEach { (subject, groupedQuestions) ->
+            // All default and teacher-authored questions share one canonical parent per subject.
+            // Ownership belongs to each question document, never to the parent bank.
+            val bankId = defaultQuestionBankId(subject)
             val questionsRef = firestore.collection(QUESTION_BANKS_COLLECTION)
                 .document(bankId)
                 .collection(QUESTIONS_SUBCOLLECTION)
 
-            // One upfront id read distinguishes new docs from overwrites, so the bank count
-            // below needs no re-download.
-            val existingIds = questionsRef.get().await().documents.map { it.id }.toSet()
+            val defaultSignatures = questionsRef
+                .whereEqualTo("isDefault", true)
+                .get()
+                .await()
+                .documents
+                .mapNotNull { snapshot ->
+                    normalizeQuestionSignature(snapshot.getString("questionText").orEmpty())
+                        .takeIf { it.isNotEmpty() }
+                }
+                .toSet()
+            val ownedTargets = questionsRef
+                .whereEqualTo("uploadedByUid", owner.uid)
+                .get()
+                .await()
+                .documents
+                .mapNotNull { snapshot ->
+                    val signature = normalizeQuestionSignature(
+                        snapshot.getString("questionText").orEmpty(),
+                    )
+                    if (signature.isEmpty()) return@mapNotNull null
+                    val existingId = snapshot.getLong("id")
+                        ?: snapshot.id.toLongOrNull()
+                        ?: return@mapNotNull null
+                    signature to (snapshot.reference to existingId)
+                }
+                .toMap()
+                .toMutableMap()
 
             val normalizedQuestions = groupedQuestions.map { question ->
-                if (question.id == 0L) question.copy(id = generateId()) else question
+                question.copy(
+                    id = if (question.id == 0L) generateId() else question.id,
+                    questionBankId = bankId,
+                )
             }
 
             // Chunked at 450; Firestore caps a batch at 500 ops.
-            val writtenDocIds = mutableSetOf<String>()
             var batch = firestore.batch()
             var ops = 0
+            val seenIncoming = mutableSetOf<String>()
             for (normalizedQuestion in normalizedQuestions) {
-                val docId = normalizedQuestion.id.toString()
-                writtenDocIds.add(docId)
+                val signature = normalizeQuestionSignature(normalizedQuestion.questionText)
+                if (signature.isEmpty() || !seenIncoming.add(signature) || signature in defaultSignatures) {
+                    continue
+                }
+                val existingTarget = ownedTargets[signature]
+                val targetId = existingTarget?.second ?: normalizedQuestion.id
+                val targetRef = existingTarget?.first ?: questionsRef.document(targetId.toString())
+                val questionToWrite = normalizedQuestion.copy(id = targetId)
                 batch.set(
-                    questionsRef.document(docId),
+                    targetRef,
                     mapOf(
-                        "id" to normalizedQuestion.id,
-                        "subject" to normalizedQuestion.subject,
-                        "fileName" to normalizedQuestion.fileName,
-                        "category" to normalizedQuestion.category,
-                        "topic" to normalizedQuestion.topic,
-                        "questionNumber" to normalizedQuestion.questionNumber,
-                        "questionText" to normalizedQuestion.questionText,
-                        "optionA" to normalizedQuestion.optionA,
-                        "optionB" to normalizedQuestion.optionB,
-                        "optionC" to normalizedQuestion.optionC,
-                        "optionD" to normalizedQuestion.optionD,
-                        "correctAnswer" to normalizedQuestion.correctAnswer,
-                        "questionBankId" to normalizedQuestion.questionBankId,
-                        "importSessionId" to normalizedQuestion.importSessionId,
-                        "customSessionName" to normalizedQuestion.customSessionName,
-                        "sourceFileName" to normalizedQuestion.fileName,
-                        "uploadedByUid" to uid,
-                        "uploadedByTeacherId" to teacherId,
+                        "id" to questionToWrite.id,
+                        "subject" to questionToWrite.subject,
+                        "fileName" to questionToWrite.fileName,
+                        "category" to questionToWrite.category,
+                        "topic" to questionToWrite.topic,
+                        "questionNumber" to questionToWrite.questionNumber,
+                        "questionText" to questionToWrite.questionText,
+                        "optionA" to questionToWrite.optionA,
+                        "optionB" to questionToWrite.optionB,
+                        "optionC" to questionToWrite.optionC,
+                        "optionD" to questionToWrite.optionD,
+                        "correctAnswer" to questionToWrite.correctAnswer,
+                        "questionBankId" to questionToWrite.questionBankId,
+                        "importSessionId" to questionToWrite.importSessionId,
+                        "customSessionName" to questionToWrite.customSessionName,
+                        "sourceFileName" to questionToWrite.fileName,
+                        "isDefault" to false,
+                        "uploadedByUid" to owner.uid,
+                        "uploadedByTeacherId" to owner.teacherId,
                         "syncedAt" to com.google.firebase.Timestamp.now()
-                    )
+                    ),
+                    SetOptions.merge(),
                 )
+                ownedTargets[signature] = targetRef to targetId
+                totalWritten++
                 if (++ops >= 450) { batch.commit().await(); batch = firestore.batch(); ops = 0 }
             }
             if (ops > 0) batch.commit().await()
-
-            // Overwrites of existing ids don't change the count.
-            val refreshedCount = existingIds.size + writtenDocIds.count { it !in existingIds }
-
-            val representative = groupedQuestions.first()
-            firestore.collection(QUESTION_BANKS_COLLECTION)
-                .document(bankId)
-                .set(
-                    mapOf(
-                        "questionBankId" to bankId,
-                        "subject" to representative.subject,
-                        "sourceFileName" to representative.fileName,
-                        "displayName" to (representative.customSessionName ?: representative.fileName),
-                        "questionCount" to refreshedCount,
-                        "uploadedByUid" to uid,
-                        "uploadedByTeacherId" to teacherId,
-                        "legacyImportSessionId" to representative.importSessionId,
-                        "updatedAt" to com.google.firebase.Timestamp.now(),
-                        "createdAt" to com.google.firebase.Timestamp.now()
-                    )
-                )
-                .await()
         }
+        return totalWritten
     }
 
     fun getQuestionsBySubject(subject: String): Flow<List<Question>> {
         return callbackFlow {
-            val uid = runCatching { ensureFirebaseUserUid() }.getOrElse {
+            val owner = runCatching { currentOwner() }.getOrElse {
                 trySend(emptyList())
                 awaitClose { }
                 return@callbackFlow
             }
 
-            val listener = firestore.collection(QUESTION_BANKS_COLLECTION)
-                .whereEqualTo("uploadedByUid", uid)
+            var ownQuestionDocs = emptyList<com.google.firebase.firestore.DocumentSnapshot>()
+            var defaultQuestionDocs = emptyList<com.google.firebase.firestore.DocumentSnapshot>()
+            val bankId = defaultQuestionBankId(subject)
+            val questions = firestore.collection(QUESTION_BANKS_COLLECTION)
+                .document(bankId)
+                .collection(QUESTIONS_SUBCOLLECTION)
+
+            fun publishQuestions() {
+                val visible = (defaultQuestionDocs + ownQuestionDocs)
+                    .distinctBy { it.id }
+                    .mapNotNull { it.toQuestion(bankId, true) }
+                    .filter { it.subject == subject }
+                    .sortedBy { it.questionNumber }
+                trySend(visible)
+            }
+
+            val ownedListener = questions
+                .whereEqualTo("uploadedByUid", owner.uid)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
                         trySend(emptyList())
                         return@addSnapshotListener
                     }
-                    val bankIds = snapshot?.documents
-                        ?.filter { it.getString("subject") == subject && it.getLong("deletedAt") == null }
-                        ?.map { it.id }
-                        .orEmpty()
-                    launch {
-                        val questions = loadQuestionsFromBanks(uid, bankIds)
-                            .filter { it.subject == subject }
-                            .sortedWith(compareBy<Question> { it.questionBankId }.thenBy { it.questionNumber })
-                        trySend(questions)
+                    ownQuestionDocs = snapshot?.documents.orEmpty()
+                    publishQuestions()
+                }
+            val defaultListener = questions
+                .whereEqualTo("isDefault", true)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) {
+                        trySend(emptyList())
+                        return@addSnapshotListener
                     }
+                    defaultQuestionDocs = snapshot?.documents.orEmpty()
+                    publishQuestions()
                 }
 
-            awaitClose { listener.remove() }
+            awaitClose {
+                ownedListener.remove()
+                defaultListener.remove()
+            }
         }
     }
 
     suspend fun getAllQuestionsForSubjectOnce(subject: String): List<Question> {
-        val uid = ensureFirebaseUserUid()
-        val bankSnapshot = firestore.collection(QUESTION_BANKS_COLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
-            .whereEqualTo("subject", subject)
-            .get()
-            .await()
-        val bankIds = bankSnapshot.documents
-            .filter { it.getLong("deletedAt") == null }
-            .map { it.id }
-        return loadQuestionsFromBanks(uid, bankIds)
+        val owner = currentOwner()
+        val bank = AccessibleBank(defaultQuestionBankId(subject), true)
+        return loadQuestionsFromBanks(owner.uid, listOf(bank))
             .filter { it.subject == subject }
             .sortedWith(compareBy<Question> { it.questionBankId }.thenBy { it.questionNumber })
     }
 
     suspend fun deleteQuestion(question: Question): Int {
-        val uid = ensureFirebaseUserUid()
+        if (question.isDefault) return 0
+        val owner = currentOwner()
         val directDocRef = firestore.collection(QUESTION_BANKS_COLLECTION)
             .document(question.questionBankId)
             .collection(QUESTIONS_SUBCOLLECTION)
             .document(question.id.toString())
         val directDoc = directDocRef.get().await()
-        if (directDoc.exists()) {
+        if (directDoc.exists() && directDoc.getString("uploadedByUid") == owner.uid) {
             directDocRef.delete().await()
-            refreshQuestionBankCount(uid, question.questionBankId)
             return 1
         }
 
-        // Legacy/mismatched bank IDs: scan the user's banks directly (avoids a collection-group index).
-        val bankIds = getUserBankIds(uid)
+        // A migrated legacy question may still carry its former bank id in local Room state.
+        val bankIds = canonicalQuestionBankIds()
         var deleted = 0
         bankIds.forEach { bankId ->
             val docRef = firestore.collection(QUESTION_BANKS_COLLECTION)
@@ -176,9 +216,8 @@ class QuestionRepository @Inject constructor(
                 .collection(QUESTIONS_SUBCOLLECTION)
                 .document(question.id.toString())
             val snapshot = docRef.get().await()
-            if (snapshot.exists()) {
+            if (snapshot.exists() && snapshot.getString("uploadedByUid") == owner.uid) {
                 docRef.delete().await()
-                refreshQuestionBankCount(uid, bankId)
                 deleted++
             }
         }
@@ -186,16 +225,15 @@ class QuestionRepository @Inject constructor(
     }
 
     suspend fun deleteQuestionsByImportSessionId(importSessionId: Long): Int {
-        val uid = ensureFirebaseUserUid()
+        val owner = currentOwner()
         var deletedCount = 0
-        getUserBankIds(uid).forEach { bankId ->
+        canonicalQuestionBankIds().forEach { bankId ->
             val col = firestore.collection(QUESTION_BANKS_COLLECTION)
                 .document(bankId)
                 .collection(QUESTIONS_SUBCOLLECTION)
-            val matchingDocs = findByImportSessionId(col, uid, importSessionId)
+            val matchingDocs = findByImportSessionId(col, owner.uid, importSessionId)
             if (matchingDocs.isNotEmpty()) {
                 batchDelete(matchingDocs.map { it.reference })
-                refreshQuestionBankCount(uid, bankId)
             }
             deletedCount += matchingDocs.size
         }
@@ -203,27 +241,27 @@ class QuestionRepository @Inject constructor(
     }
 
     suspend fun deleteQuestionsByQuestionBankId(questionBankId: String): Int {
-        val uid = ensureFirebaseUserUid()
-        val bankDocs = firestore.collection(QUESTION_BANKS_COLLECTION)
-            .document(questionBankId)
+        val owner = currentOwner()
+        val directBankId = questionBankId.takeIf(::isDefaultQuestionBankId)
+        val bankDocs = directBankId?.let { bankId -> firestore.collection(QUESTION_BANKS_COLLECTION)
+            .document(bankId)
             .collection(QUESTIONS_SUBCOLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
+            .whereEqualTo("uploadedByUid", owner.uid)
             .get()
             .await()
-            .documents
+            .documents }.orEmpty()
         if (bankDocs.isNotEmpty()) {
             batchDelete(bankDocs.map { it.reference })
-            firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId).delete().await()
             return bankDocs.size
         }
 
-        // Legacy fallback: locate matching docs by metadata across user's banks.
+        // Legacy fallback: locate migrated docs by their former metadata value.
         var deletedCount = 0
-        getUserBankIds(uid).forEach { bankId ->
+        canonicalQuestionBankIds().forEach { bankId ->
             val docs = firestore.collection(QUESTION_BANKS_COLLECTION)
                 .document(bankId)
                 .collection(QUESTIONS_SUBCOLLECTION)
-                .whereEqualTo("uploadedByUid", uid)
+                .whereEqualTo("uploadedByUid", owner.uid)
                 .get()
                 .await()
                 .documents
@@ -238,7 +276,6 @@ class QuestionRepository @Inject constructor(
             }
             if (matchingDocs.isNotEmpty()) {
                 batchDelete(matchingDocs.map { it.reference })
-                refreshQuestionBankCount(uid, bankId)
             }
             deletedCount += matchingDocs.size
         }
@@ -253,9 +290,9 @@ class QuestionRepository @Inject constructor(
 
     suspend fun getQuestionsByImportSessionIdsOnly(importSessionIds: List<Long>): List<Question> {
         if (importSessionIds.isEmpty()) return emptyList()
-        val uid = ensureFirebaseUserUid()
+        val owner = currentOwner()
         val docs = firestore.collectionGroup(QUESTIONS_SUBCOLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
+            .whereEqualTo("uploadedByUid", owner.uid)
             .get()
             .await()
         return docs.documents
@@ -266,75 +303,69 @@ class QuestionRepository @Inject constructor(
 
     suspend fun getQuestionsByQuestionBankIdsOnly(questionBankIds: List<String>): List<Question> {
         if (questionBankIds.isEmpty()) return emptyList()
-        val uid = ensureFirebaseUserUid()
-        // Skip banks that are in the Trash so a deleted bank's questions can't be drawn into a new exam.
-        val activeBankIds = questionBankIds.filter { bankId ->
-            firestore.collection(QUESTION_BANKS_COLLECTION).document(bankId).get().await()
-                .getLong("deletedAt") == null
-        }
-        return loadQuestionsFromBanks(uid, activeBankIds)
-            .filter { activeBankIds.contains(it.questionBankId) }
+        val owner = currentOwner()
+        val activeBanks = questionBankIds
+            .filter(::isDefaultQuestionBankId)
+            .distinct()
+            .map { AccessibleBank(it, true) }
+        val activeBankIds = activeBanks.map { it.id }.toSet()
+        return loadQuestionsFromBanks(owner.uid, activeBanks)
+            .filter { it.questionBankId in activeBankIds }
             .sortedWith(compareBy<Question> { it.questionBankId }.thenBy { it.questionNumber })
     }
 
     suspend fun updateCustomSessionName(importSessionId: Long, newName: String): Int {
-        val uid = ensureFirebaseUserUid()
+        val owner = currentOwner()
         // Per-bank queries: a collectionGroup filter on importSessionId would need a
         // collection-group index.
-        val matchingDocs = getUserBankIds(uid).flatMap { bankId ->
+        val matchingDocs = canonicalQuestionBankIds().flatMap { bankId ->
             val col = firestore.collection(QUESTION_BANKS_COLLECTION)
                 .document(bankId)
                 .collection(QUESTIONS_SUBCOLLECTION)
-            findByImportSessionId(col, uid, importSessionId)
+            findByImportSessionId(col, owner.uid, importSessionId)
         }.distinctBy { it.reference.path }
         batchUpdate(matchingDocs.map { it.reference }, mapOf("customSessionName" to newName))
         return matchingDocs.size
     }
 
     suspend fun updateCustomSessionNameByQuestionBankId(questionBankId: String, newName: String): Int {
-        val uid = ensureFirebaseUserUid()
+        val owner = currentOwner()
         // legacy_<sessionId> banks: old docs may carry only the session id, so match both ways.
         val legacySessionId = questionBankId.takeIf { it.startsWith("legacy_") }
             ?.removePrefix("legacy_")?.toLongOrNull()
-        val matchingDocs = getUserBankIds(uid).flatMap { bankId ->
+        val matchingDocs = canonicalQuestionBankIds().flatMap { bankId ->
             val col = firestore.collection(QUESTION_BANKS_COLLECTION)
                 .document(bankId)
                 .collection(QUESTIONS_SUBCOLLECTION)
-            val byBankField = col.whereEqualTo("uploadedByUid", uid)
+            val byBankField = col.whereEqualTo("uploadedByUid", owner.uid)
                 .whereEqualTo("questionBankId", questionBankId)
                 .get()
                 .await()
                 .documents
-            val byLegacySession = legacySessionId?.let { findByImportSessionId(col, uid, it) }.orEmpty()
+            val byLegacySession = legacySessionId?.let { findByImportSessionId(col, owner.uid, it) }.orEmpty()
             byBankField + byLegacySession
         }.distinctBy { it.reference.path }
         batchUpdate(matchingDocs.map { it.reference }, mapOf("customSessionName" to newName))
-        firestore.collection(QUESTION_BANKS_COLLECTION)
-            .document(questionBankId)
-            .set(
-                mapOf(
-                    "displayName" to newName,
-                    "updatedAt" to com.google.firebase.Timestamp.now()
-                ),
-                SetOptions.merge()
-            )
-            .await()
         return matchingDocs.size
     }
 
     /** Soft-delete a bank: its questions stop being available for exam generation, restorable for
      *  30 days. Fire-and-forget (offline-durable). */
     suspend fun softDeleteQuestionBank(questionBankId: String) {
-        firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId)
-            .set(mapOf("deletedAt" to System.currentTimeMillis()), SetOptions.merge())
+        val owner = currentOwner()
+        updateBankIfOwned(
+            questionBankId,
+            owner.teacherId,
+            mapOf("deletedAt" to System.currentTimeMillis()),
+        )
     }
 
     fun getTrashedBanks(): Flow<List<TrashedBank>> = callbackFlow {
-        val uid = runCatching { ensureFirebaseUserUid() }.getOrElse {
+        val owner = runCatching { currentOwner() }.getOrElse {
             trySend(emptyList()); awaitClose { }; return@callbackFlow
         }
         val listener = firestore.collection(QUESTION_BANKS_COLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
+            .whereEqualTo("uploadedByTeacherId", owner.teacherId)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) { trySend(emptyList()); return@addSnapshotListener }
                 val trashed = snapshot?.documents.orEmpty()
@@ -356,30 +387,30 @@ class QuestionRepository @Inject constructor(
     }
 
     suspend fun restoreQuestionBank(questionBankId: String) {
-        firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId)
-            .set(mapOf("deletedAt" to null), SetOptions.merge())
+        val owner = currentOwner()
+        updateBankIfOwned(questionBankId, owner.teacherId, mapOf("deletedAt" to null))
     }
 
     /** Permanently delete a bank and all of its questions. */
     suspend fun purgeQuestionBank(questionBankId: String) {
-        val uid = ensureFirebaseUserUid()
+        val owner = currentOwner()
         val questionDocs = firestore.collection(QUESTION_BANKS_COLLECTION)
             .document(questionBankId)
             .collection(QUESTIONS_SUBCOLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
+            .whereEqualTo("uploadedByUid", owner.uid)
             .get()
             .await()
             .documents
         questionDocs.forEach { it.reference.delete() }
-        firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId).delete()
+        deleteBankIfOwned(questionBankId, owner.teacherId)
     }
 
     /** Ids of trashed banks past the 30-day window — the caller purges each (and its linked exams). */
     suspend fun getExpiredBankIds(): List<String> {
-        val uid = ensureFirebaseUserUid()
+        val owner = currentOwner()
         val threshold = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30)
         return firestore.collection(QUESTION_BANKS_COLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
+            .whereEqualTo("uploadedByTeacherId", owner.teacherId)
             .get()
             .await()
             .documents
@@ -394,76 +425,63 @@ class QuestionRepository @Inject constructor(
         return authResult.user?.uid ?: throw IllegalStateException("Firebase sign-in failed: missing user.")
     }
 
+    private suspend fun currentOwner(): QuestionOwner {
+        val uid = ensureFirebaseUserUid()
+        val teacherId = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            .getString("teacher_id", null)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: uid
+        return QuestionOwner(uid = uid, teacherId = teacherId)
+    }
+
     // Question docs are keyed by id.toString(): a collision overwrites another question.
     private fun generateId(): Long = com.pbec.preboardexamchecker.utils.IdGenerator.newId()
 
-    private suspend fun refreshQuestionBankCount(uid: String, questionBankId: String) {
-        if (questionBankId.isBlank()) return
-        val bankRef = firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId)
-        val countSnapshot = bankRef.collection(QUESTIONS_SUBCOLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
-            .get()
-            .await()
-        val count = countSnapshot.size()
-        if (count == 0) {
-            bankRef.delete().await()
-            return
-        }
-        bankRef.set(
-            mapOf(
-                "questionBankId" to questionBankId,
-                "questionCount" to count,
-                "uploadedByUid" to uid,
-                "updatedAt" to com.google.firebase.Timestamp.now()
-            ),
-            SetOptions.merge()
-        ).await()
-    }
-
-    private suspend fun loadQuestionsFromBanks(uid: String, bankIds: List<String>): List<Question> {
-        if (bankIds.isEmpty()) return emptyList()
+    private suspend fun loadQuestionsFromBanks(
+        uid: String,
+        banks: List<AccessibleBank>,
+    ): List<Question> {
+        if (banks.isEmpty()) return emptyList()
         // One round-trip per bank, fetched concurrently.
         return coroutineScope {
-            bankIds.map { bankId ->
+            banks.map { bank ->
                 async {
-                    firestore.collection(QUESTION_BANKS_COLLECTION)
-                        .document(bankId)
+                    val query = firestore.collection(QUESTION_BANKS_COLLECTION)
+                        .document(bank.id)
                         .collection(QUESTIONS_SUBCOLLECTION)
-                        .whereEqualTo("uploadedByUid", uid)
-                        .get()
-                        .await()
-                        .documents.mapNotNull { it.toQuestion() }
+                    val docs = if (bank.isDefault) {
+                        val defaultDocs = async {
+                            query.whereEqualTo("isDefault", true).get().await().documents
+                        }
+                        val teacherDocs = async {
+                            query.whereEqualTo("uploadedByUid", uid).get().await().documents
+                        }
+                        (defaultDocs.await() + teacherDocs.await()).distinctBy { it.id }
+                    } else {
+                        query.whereEqualTo("uploadedByUid", uid).get().await().documents
+                    }
+                    docs.mapNotNull { it.toQuestion(bank.id, bank.isDefault) }
                 }
             }.awaitAll()
         }.flatten()
     }
 
-    private suspend fun getUserBankIds(uid: String): List<String> {
-        return firestore.collection(QUESTION_BANKS_COLLECTION)
-            .whereEqualTo("uploadedByUid", uid)
-            .get()
-            .await()
-            .documents
-            .map { it.id }
-    }
+    private fun canonicalQuestionBankIds(): List<String> = listOf(
+        defaultQuestionBankId("Mathematics"),
+        defaultQuestionBankId("ESAS"),
+        defaultQuestionBankId("Professional EE"),
+    )
 
-    /**
-     * importSessionId is stored as Long or String depending on doc age: query both types,
-     * fall back to a client-side scan of the bank only when both miss (odd legacy encodings).
-     */
+    private fun normalizeQuestionSignature(questionText: String): String =
+        QUESTION_WHITESPACE.replace(questionText.trim().lowercase(Locale.ROOT), " ")
+
+    /** importSessionId is stored as Long or String depending on document age. */
     private suspend fun findByImportSessionId(
         col: com.google.firebase.firestore.CollectionReference,
         uid: String,
         importSessionId: Long,
     ): List<com.google.firebase.firestore.DocumentSnapshot> {
-        val asLong = col.whereEqualTo("uploadedByUid", uid)
-            .whereEqualTo("importSessionId", importSessionId)
-            .get().await().documents
-        val asString = col.whereEqualTo("uploadedByUid", uid)
-            .whereEqualTo("importSessionId", importSessionId.toString())
-            .get().await().documents
-        val narrowed = (asLong + asString).distinctBy { it.reference.path }
-        if (narrowed.isNotEmpty()) return narrowed
         return col.whereEqualTo("uploadedByUid", uid).get().await().documents.filter { doc ->
             doc.getLong("importSessionId") == importSessionId ||
                 doc.getString("importSessionId")?.toLongOrNull() == importSessionId
@@ -495,7 +513,32 @@ class QuestionRepository @Inject constructor(
         if (ops > 0) batch.commit().await()
     }
 
-    private fun com.google.firebase.firestore.DocumentSnapshot.toQuestion(): Question? {
+    private suspend fun updateBankIfOwned(
+        questionBankId: String,
+        teacherId: String,
+        updates: Map<String, Any?>,
+    ) {
+        if (isDefaultQuestionBankId(questionBankId)) return
+        val bankRef = firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId)
+        val bank = bankRef.get().await()
+        if (bank.getBoolean("isDefault") != true && bank.getString("uploadedByTeacherId") == teacherId) {
+            bankRef.set(updates, SetOptions.merge()).await()
+        }
+    }
+
+    private suspend fun deleteBankIfOwned(questionBankId: String, teacherId: String) {
+        if (isDefaultQuestionBankId(questionBankId)) return
+        val bankRef = firestore.collection(QUESTION_BANKS_COLLECTION).document(questionBankId)
+        val bank = bankRef.get().await()
+        if (bank.getBoolean("isDefault") != true && bank.getString("uploadedByTeacherId") == teacherId) {
+            bankRef.delete().await()
+        }
+    }
+
+    private fun com.google.firebase.firestore.DocumentSnapshot.toQuestion(
+        containingBankId: String = reference.parent.parent?.id.orEmpty(),
+        isDefaultBank: Boolean = false,
+    ): Question? {
         val subject = getString("subject") ?: return null
         val fileName = getString("fileName")
             ?: getString("sourceFileName")
@@ -514,6 +557,7 @@ class QuestionRepository @Inject constructor(
             ?: 0L
         val sourceFileName = getString("sourceFileName")
         val parsedQuestionBankId = getString("questionBankId")
+            ?: containingBankId.takeIf { it.isNotBlank() }
             ?: when {
                 parsedImportSessionId != 0L -> "legacy_$parsedImportSessionId"
                 !sourceFileName.isNullOrBlank() -> "legacy_file_${sourceFileName.trim().lowercase()}"
@@ -538,7 +582,15 @@ class QuestionRepository @Inject constructor(
             correctAnswer = getString("correctAnswer"),
             questionBankId = parsedQuestionBankId,
             importSessionId = parsedImportSessionId,
-            customSessionName = getString("customSessionName")
+            customSessionName = getString("customSessionName"),
+            isDefault = getBoolean("isDefault") == true ||
+                (isDefaultBank && getString("uploadedByUid").isNullOrBlank() &&
+                    getString("uploadedByTeacherId").isNullOrBlank()),
+            uploadedByUid = getString("uploadedByUid").orEmpty(),
+            uploadedByTeacherId = getString("uploadedByTeacherId").orEmpty(),
         )
     }
+
+    private data class QuestionOwner(val uid: String, val teacherId: String)
+    private data class AccessibleBank(val id: String, val isDefault: Boolean)
 }

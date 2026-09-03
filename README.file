@@ -31,7 +31,7 @@ adb shell monkey -p com.pbec.preboardexamchecker 1
 Use a device id when multiple devices are connected:
 
 ```bash
-adb -s <device-id> shell monkey -p com.pbec.preboardexamchecker 1
+adb -s adb-f57fb3ec-A0lbLs._adb-tls-connect._tcp shell monkey -p com.pbec.preboardexamchecker 1
 ```
 
 ## Exam Generation

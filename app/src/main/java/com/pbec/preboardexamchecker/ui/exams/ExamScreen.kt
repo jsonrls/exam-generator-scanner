@@ -121,9 +121,12 @@ fun ExamScreen(
 
     val sortedImportSessionIds = remember(questionsByImportSession.keys) {
         val sessionKeys = questionsByImportSession.keys
+        val defaultSession = sessionKeys.filter(examBankViewModel::isDefaultBankId)
         val manualSession = sessionKeys.filter { it == "manual" || it.startsWith("manual_") }
-        val importedSessions = sessionKeys.filter { it != "manual" && !it.startsWith("manual_") }.sortedDescending()
-        importedSessions + manualSession
+        val importedSessions = sessionKeys.filter {
+            !examBankViewModel.isDefaultBankId(it) && it != "manual" && !it.startsWith("manual_")
+        }.sortedDescending()
+        defaultSession + importedSessions + manualSession
     }
 
     val scope = rememberCoroutineScope()
@@ -416,12 +419,14 @@ fun ExamScreen(
                                     .fillMaxWidth()
                                     .heightIn(max = 200.dp)
                             ) {
-                                itemsIndexed(sortedImportSessionIds, key = { _, id -> id }) { index, importSessionId ->
+                                itemsIndexed(sortedImportSessionIds, key = { _, id -> id }) { _, importSessionId ->
                                     val questionsInSession = questionsByImportSession[importSessionId] ?: emptyList()
-                                    val headerText = if (importSessionId == "manual" || importSessionId.startsWith("manual_")) {
-                                        "Manually Added"
-                                    } else {
-                                        questionsInSession.firstOrNull()?.fileName ?: "Imported File"
+                                    val isDefaultSession = examBankViewModel.isDefaultBankId(importSessionId)
+                                    val isManualSession = importSessionId == "manual" || importSessionId.startsWith("manual_")
+                                    val headerText = when {
+                                        isDefaultSession -> "Default Question Bank"
+                                        isManualSession -> "Manually Added"
+                                        else -> questionsInSession.firstOrNull()?.fileName ?: "Imported File"
                                     }
                                     Row(
                                         modifier = Modifier
@@ -441,10 +446,13 @@ fun ExamScreen(
                                             }
                                         )
                                         Text(
-                                            text = if (importSessionId == "manual" || importSessionId.startsWith("manual_")) {
+                                            text = if (isDefaultSession || isManualSession) {
                                                 "$headerText (${questionsInSession.size} questions)"
                                             } else {
-                                                "$headerText #${String.format(Locale.getDefault(), "%03d", index + 1)} (${questionsInSession.size} questions)"
+                                                val importIndex = sortedImportSessionIds
+                                                    .filter { !examBankViewModel.isDefaultBankId(it) && it != "manual" && !it.startsWith("manual_") }
+                                                    .indexOf(importSessionId)
+                                                "$headerText #${String.format(Locale.getDefault(), "%03d", importIndex + 1)} (${questionsInSession.size} questions)"
                                             },
                                             style = MaterialTheme.typography.bodyMedium,
                                             modifier = Modifier.weight(1f)

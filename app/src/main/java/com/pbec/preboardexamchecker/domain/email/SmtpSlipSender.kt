@@ -67,11 +67,12 @@ class SmtpSlipSender @Inject constructor() {
      * first, then the other, so a single blocked port doesn't take email down entirely.
      */
     private fun candidatePorts(config: EmailConfig): List<Int> {
-        val alternate = when (config.host) {
-            "smtp.gmail.com", "smtp.mail.yahoo.com" -> if (config.port == 465) 587 else 465
-            else -> null // Office 365 / a custom "Other" host: only the configured port is known-good.
+        val alternates = when (config.host) {
+            "smtp.gmail.com", "smtp.mail.yahoo.com" -> listOf(465, 587)
+            "smtp.maileroo.com" -> listOf(465, 587, 2525)
+            else -> emptyList() // Office 365 / custom hosts: only the configured port is known-good.
         }
-        return listOfNotNull(config.port, alternate)
+        return (listOf(config.port) + alternates).distinct()
     }
 
     /** Builds a Jakarta Mail [Session] for [config] on [port]; STARTTLS on 587, implicit SSL on 465. */
@@ -141,6 +142,9 @@ class SmtpSlipSender @Inject constructor() {
         attachment: File?,
     ): MimeMessage = MimeMessage(session).apply {
         setFrom(fromAddress(config))
+        if (config.replyToAddress.isNotBlank()) {
+            setReplyTo(InternetAddress.parse(config.replyToAddress))
+        }
         setRecipients(Message.RecipientType.TO, InternetAddress.parse(to))
         setSubject(subject)
         if (attachment == null) {
@@ -265,8 +269,9 @@ class SmtpSlipSender @Inject constructor() {
         val result = connectAny(config)
         val transport = result.transport ?: return@withContext result.error
         try {
+            val recipient = config.testRecipientAddress
             val msg = buildMessage(
-                session(config, result.port), config, config.fromAddress,
+                session(config, result.port), config, recipient,
                 subject = "PreBoard test email",
                 body = "This is a test email from the PreBoard Exam Checker app. Your email settings work.",
                 attachment = null,

@@ -20,5 +20,8 @@ data class Question(
     val correctAnswer: String?,
     val questionBankId: String = "manual",
     val importSessionId: Long = 0L,
-    val customSessionName: String? = null
+    val customSessionName: String? = null,
+    val isDefault: Boolean = false,
+    val uploadedByUid: String = "",
+    val uploadedByTeacherId: String = "",
 )

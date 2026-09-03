@@ -22,6 +22,7 @@ import androidx.navigation.NavController
 import com.pbec.preboardexamchecker.domain.email.EmailConfig
 import com.pbec.preboardexamchecker.domain.email.EmailProvider
 import com.pbec.preboardexamchecker.domain.email.EmailSettings
+import com.pbec.preboardexamchecker.domain.email.MailerooDefaults
 import com.pbec.preboardexamchecker.domain.email.SmtpSlipSender
 import com.pbec.preboardexamchecker.ui.theme.BrandTopAppBar
 import kotlinx.coroutines.launch
@@ -31,6 +32,7 @@ private fun appPasswordHelpUrl(provider: EmailProvider): String? = when (provide
     EmailProvider.GMAIL -> "https://myaccount.google.com/apppasswords"
     EmailProvider.YAHOO -> "https://login.yahoo.com/account/security"
     EmailProvider.OUTLOOK -> "https://account.microsoft.com/security"
+    EmailProvider.MAILEROO -> "https://app.maileroo.com/domains"
     EmailProvider.OTHER -> null
 }
 
@@ -46,6 +48,8 @@ fun EmailSettingsScreen(navController: NavController) {
     var provider by remember { mutableStateOf(initial.provider) }
     var fromAddress by remember { mutableStateOf(initial.fromAddress) }
     var senderName by remember { mutableStateOf(initial.senderName) }
+    var replyToAddress by remember { mutableStateOf(initial.replyToAddress) }
+    var testRecipient by remember { mutableStateOf(initial.testRecipient) }
     var password by remember { mutableStateOf(initial.password) }
     var customHost by remember { mutableStateOf(initial.customHost) }
     var customPort by remember { mutableStateOf(initial.customPort.toString()) }
@@ -58,6 +62,8 @@ fun EmailSettingsScreen(navController: NavController) {
         provider = provider,
         fromAddress = fromAddress,
         senderName = senderName,
+        replyToAddress = replyToAddress,
+        testRecipient = testRecipient,
         password = password,
         customHost = customHost,
         customPort = customPort.toIntOrNull() ?: 587,
@@ -101,10 +107,20 @@ fun EmailSettingsScreen(navController: NavController) {
                         EmailProvider.GMAIL -> "smtp.gmail.com"
                         EmailProvider.YAHOO -> "smtp.mail.yahoo.com"
                         EmailProvider.OUTLOOK -> "smtp.office365.com"
+                        EmailProvider.MAILEROO -> "smtp.maileroo.com"
                         EmailProvider.OTHER -> "Enter your own SMTP server"
                     },
                     selected = provider == p,
-                    onSelect = { provider = p },
+                    onSelect = {
+                        if (provider != p) password = ""
+                        provider = p
+                        if (p == EmailProvider.MAILEROO) {
+                            fromAddress = MailerooDefaults.FROM_ADDRESS
+                            senderName = MailerooDefaults.SENDER_NAME
+                            replyToAddress = MailerooDefaults.REPLY_TO_ADDRESS
+                            testRecipient = MailerooDefaults.TEST_RECIPIENT
+                        }
+                    },
                 )
             }
 
@@ -113,7 +129,9 @@ fun EmailSettingsScreen(navController: NavController) {
             OutlinedTextField(
                 value = fromAddress,
                 onValueChange = { fromAddress = it },
-                label = { Text("Email address") },
+                label = {
+                    Text(if (provider == EmailProvider.MAILEROO) "SMTP username / From email" else "Email address")
+                },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                 modifier = Modifier.fillMaxWidth(),
@@ -128,9 +146,18 @@ fun EmailSettingsScreen(navController: NavController) {
             )
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
+                value = replyToAddress,
+                onValueChange = { replyToAddress = it },
+                label = { Text("Reply-to email (optional)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
                 value = password,
                 onValueChange = { password = it },
-                label = { Text("App password") },
+                label = { Text(if (provider == EmailProvider.MAILEROO) "Maileroo SMTP password" else "App password") },
                 singleLine = true,
                 visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -145,10 +172,15 @@ fun EmailSettingsScreen(navController: NavController) {
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(
-                "Not your normal login password. Turn on 2-Step Verification for your account first, " +
-                    "then generate an app password and paste the 16-character code here. " +
-                    "If you cannot find or create an app password, 2-Step Verification is probably not " +
-                    "turned on yet.",
+                if (provider == EmailProvider.MAILEROO) {
+                    "Create the results alias under Maileroo → Domains → SMTP Accounts, then paste " +
+                        "that SMTP account's generated password here. Do not use your Maileroo login password."
+                } else {
+                    "Not your normal login password. Turn on 2-Step Verification for your account first, " +
+                        "then generate an app password and paste the 16-character code here. " +
+                        "If you cannot find or create an app password, 2-Step Verification is probably not " +
+                        "turned on yet."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp),
@@ -163,7 +195,12 @@ fun EmailSettingsScreen(navController: NavController) {
                         }
                     },
                     contentPadding = PaddingValues(vertical = 4.dp, horizontal = 0.dp),
-                ) { Text("How do I get a ${provider.label} app password?") }
+                ) {
+                    Text(
+                        if (provider == EmailProvider.MAILEROO) "Open Maileroo SMTP Accounts"
+                        else "How do I get a ${provider.label} app password?"
+                    )
+                }
             }
 
             if (provider == EmailProvider.OTHER) {
@@ -188,6 +225,26 @@ fun EmailSettingsScreen(navController: NavController) {
             }
 
             Spacer(Modifier.height(24.dp))
+            SettingsSectionLabel("Test delivery")
+            OutlinedTextField(
+                value = testRecipient,
+                onValueChange = { testRecipient = it },
+                label = { Text("Test recipient") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (provider == EmailProvider.MAILEROO) {
+                Text(
+                    "If this is a Maileroo sandbox domain, add the address to Authorized Recipients " +
+                        "in the Maileroo dashboard before testing.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(
                     onClick = { persist(); scope.launch { snackbar.showSnackbar("Email settings saved.") } },
@@ -201,7 +258,9 @@ fun EmailSettingsScreen(navController: NavController) {
                         scope.launch {
                             val error = sender.sendTest(currentConfig())
                             sendingTest = false
-                            testResultDialog = if (error == null) "Test email sent to $fromAddress."
+                            testResultDialog = if (error == null) {
+                                "Test email sent to ${currentConfig().testRecipientAddress}."
+                            }
                                 else "Test failed: $error"
                         }
                     },

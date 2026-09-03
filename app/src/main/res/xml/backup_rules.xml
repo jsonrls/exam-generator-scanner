@@ -6,6 +6,8 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
+    <!-- Android Keystore keys are device-bound, so this encrypted file cannot be restored safely. -->
+    <exclude domain="sharedpref" path="email_prefs.xml"/>
     <!--
    <include domain="sharedpref" path="."/>
    <exclude domain="sharedpref" path="device.xml"/>

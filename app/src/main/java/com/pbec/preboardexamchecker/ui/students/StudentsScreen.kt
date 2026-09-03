@@ -33,7 +33,9 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.pbec.preboardexamchecker.data.models.ExamCluster
+import com.pbec.preboardexamchecker.data.models.STUDENT_YEAR_LEVELS
 import com.pbec.preboardexamchecker.data.models.Student
+import com.pbec.preboardexamchecker.data.models.canonicalYearLevel
 import com.pbec.preboardexamchecker.ui.Screen
 import com.pbec.preboardexamchecker.ui.components.DeleteConfirmationDialog
 import com.pbec.preboardexamchecker.ui.components.DeleteDialogAction
@@ -49,12 +51,9 @@ fun StudentsScreen(
     viewModel: StudentsViewModel = hiltViewModel(),
 ) {
     val students by viewModel.studentsState.collectAsState()
-    val allStudents by viewModel.allStudents.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
-    val selectedSchoolYear by viewModel.selectedSchoolYear.collectAsState()
     val selectedBlock by viewModel.selectedBlock.collectAsState()
-    val selectedCourse by viewModel.selectedCourse.collectAsState()
     val selectedSort by viewModel.sort.collectAsState()
     val imports by viewModel.imports.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -88,15 +87,7 @@ fun StudentsScreen(
     var menuOpen by remember { mutableStateOf(false) }
     var showDeleteImport by remember { mutableStateOf(false) }
 
-    val schoolYearOptions = remember(allStudents) {
-        listOf("All") + allStudents.map { it.schoolYear.trim() }.filter { it.isNotEmpty() }.distinct().sorted()
-    }
-    val blockOptions = remember(allStudents) {
-        listOf("All") + allStudents.map { it.block.trim() }.filter { it.isNotEmpty() }.distinct().sorted()
-    }
-    val courseOptions = remember(allStudents) {
-        listOf("All") + allStudents.map { it.program.trim() }.filter { it.isNotEmpty() }.distinct().sorted()
-    }
+    val blockOptions = remember { listOf("All") + ('A'..'F').map(Char::toString) }
 
     LaunchedEffect(Unit) {
         viewModel.uiEvent.collectLatest { event ->
@@ -162,12 +153,10 @@ fun StudentsScreen(
                 CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
             } else {
                 Column(Modifier.fillMaxSize()) {
-                    // Records-style control row: visible sort + expandable search + filter toggle.
+                    // Search stays visible; block and sort controls expand from its filter action.
                     ControlRow(
                         search = searchQuery,
                         onSearch = viewModel::updateSearchQuery,
-                        sort = selectedSort,
-                        onSort = viewModel::updateSort,
                         filtersExpanded = filtersExpanded,
                         onToggleFilters = { filtersExpanded = !filtersExpanded },
                     )
@@ -176,11 +165,19 @@ fun StudentsScreen(
                             Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                StudentFilterDropdown("School Yr", selectedSchoolYear, schoolYearOptions, viewModel::updateSchoolYearFilter, Modifier.weight(1f))
-                                StudentFilterDropdown("Block", selectedBlock, blockOptions, viewModel::updateBlockFilter, Modifier.weight(1f))
-                            }
-                            StudentFilterDropdown("Course", selectedCourse, courseOptions, viewModel::updateCourseFilter, Modifier.fillMaxWidth())
+                            StudentFilterDropdown(
+                                label = "Block",
+                                selectedValue = selectedBlock,
+                                options = blockOptions,
+                                onValueSelected = viewModel::updateBlockFilter,
+                                modifier = Modifier.fillMaxWidth(),
+                                displayValue = { if (it == "All") it else "Block $it" },
+                            )
+                            StudentSortDropdown(
+                                selected = selectedSort,
+                                onSelect = viewModel::updateSort,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
                         }
                     }
 
@@ -405,45 +402,28 @@ private fun ClusterPickerDialog(
 private fun ControlRow(
     search: String,
     onSearch: (String) -> Unit,
-    sort: StudentSort,
-    onSort: (StudentSort) -> Unit,
     filtersExpanded: Boolean,
     onToggleFilters: () -> Unit,
 ) {
-    var searchExpanded by remember { mutableStateOf(false) }
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (searchExpanded) {
-            OutlinedTextField(
-                value = search,
-                onValueChange = onSearch,
-                placeholder = { Text("Search name or ID…") },
-                singleLine = true,
-                textStyle = MaterialTheme.typography.bodySmall,
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, Modifier.size(18.dp)) },
-                trailingIcon = {
-                    IconButton(onClick = { onSearch(""); searchExpanded = false }) {
-                        Icon(Icons.Default.Close, contentDescription = "Close search")
-                    }
-                },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                modifier = Modifier.weight(1f),
-            )
-        } else {
-            StudentSortDropdown(sort, onSort, Modifier.weight(1f))
-            IconButton(onClick = { searchExpanded = true }) { Icon(Icons.Default.Search, contentDescription = "Search") }
-        }
-        IconButton(onClick = onToggleFilters) {
-            Icon(
-                Icons.Default.Tune,
-                contentDescription = "Filters",
-                tint = if (filtersExpanded) MaterialTheme.colorScheme.primary else LocalContentColor.current,
-            )
-        }
-    }
+    OutlinedTextField(
+        value = search,
+        onValueChange = onSearch,
+        placeholder = { Text("Search name or ID…") },
+        singleLine = true,
+        textStyle = MaterialTheme.typography.bodySmall,
+        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, Modifier.size(18.dp)) },
+        trailingIcon = {
+            IconButton(onClick = onToggleFilters) {
+                Icon(
+                    Icons.Default.Tune,
+                    contentDescription = "Filters",
+                    tint = if (filtersExpanded) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                )
+            }
+        },
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -455,6 +435,7 @@ private fun StudentSortDropdown(selected: StudentSort, onSelect: (StudentSort) -
             value = selected.label,
             onValueChange = {},
             readOnly = true,
+            label = { Text("Sort by") },
             singleLine = true,
             textStyle = MaterialTheme.typography.bodySmall,
             leadingIcon = { Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = null, Modifier.size(18.dp)) },
@@ -477,11 +458,12 @@ private fun StudentFilterDropdown(
     options: List<String>,
     onValueSelected: (String) -> Unit,
     modifier: Modifier = Modifier,
+    displayValue: (String) -> String = { it },
 ) {
     var expanded by remember { mutableStateOf(false) }
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }, modifier = modifier) {
         OutlinedTextField(
-            value = selectedValue,
+            value = displayValue(selectedValue),
             onValueChange = {},
             readOnly = true,
             label = { Text(label) },
@@ -492,7 +474,7 @@ private fun StudentFilterDropdown(
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             options.forEach { option ->
-                DropdownMenuItem(text = { Text(option) }, onClick = { onValueSelected(option); expanded = false })
+                DropdownMenuItem(text = { Text(displayValue(option)) }, onClick = { onValueSelected(option); expanded = false })
             }
         }
     }
@@ -583,11 +565,11 @@ fun AddEditStudentSheet(
     var name by remember { mutableStateOf(student?.name ?: "") }
     var studentId by remember { mutableStateOf(student?.studentId ?: "") }
     var program by remember { mutableStateOf(student?.program ?: "") }
-    var yearLevel by remember { mutableStateOf(student?.yearLevel ?: "") }
+    var yearLevel by remember { mutableStateOf(canonicalYearLevel(student?.yearLevel.orEmpty())) }
     var block by remember { mutableStateOf(student?.block ?: "") }
     var email by remember { mutableStateOf(student?.email ?: "") }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val canSave = name.isNotBlank() && studentId.isNotBlank()
+    val canSave = name.isNotBlank() && studentId.isNotBlank() && yearLevel in STUDENT_YEAR_LEVELS
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -634,7 +616,11 @@ fun AddEditStudentSheet(
                 OutlinedTextField(value = studentId, onValueChange = { studentId = it }, label = { Text("Student ID") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = program, onValueChange = { program = it }, label = { Text("Program") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(value = yearLevel, onValueChange = { yearLevel = it }, label = { Text("Year Level") }, singleLine = true, modifier = Modifier.weight(1f))
+                    YearLevelDropdown(
+                        value = yearLevel,
+                        onValueChange = { yearLevel = it },
+                        modifier = Modifier.weight(1f),
+                    )
                     OutlinedTextField(value = block, onValueChange = { block = it }, label = { Text("Block") }, singleLine = true, modifier = Modifier.weight(1f))
                 }
                 OutlinedTextField(
@@ -679,6 +665,47 @@ fun AddEditStudentSheet(
                     Spacer(Modifier.width(8.dp))
                     Text("Move to Trash")
                 }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun YearLevelDropdown(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = it },
+        modifier = modifier,
+    ) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text("Year Level") },
+            placeholder = { Text("Select") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().menuAnchor(),
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            STUDENT_YEAR_LEVELS.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option) },
+                    onClick = {
+                        onValueChange(option)
+                        expanded = false
+                    },
+                )
             }
         }
     }

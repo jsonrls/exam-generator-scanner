@@ -5,6 +5,19 @@ import com.google.firebase.firestore.DocumentId
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.ServerTimestamp
 
+val STUDENT_YEAR_LEVELS = listOf("1st Year", "2nd Year", "3rd Year", "4th Year")
+
+fun canonicalYearLevel(value: String): String {
+    val normalized = value.trim().lowercase()
+    return when (normalized) {
+        "1", "1st", "1st year", "first", "first year" -> "1st Year"
+        "2", "2nd", "2nd year", "second", "second year" -> "2nd Year"
+        "3", "3rd", "3rd year", "third", "third year" -> "3rd Year"
+        "4", "4th", "4th year", "fourth", "fourth year" -> "4th Year"
+        else -> value.trim()
+    }
+}
+
 data class Student(
     @DocumentId
     val id: String = "",
@@ -16,7 +29,7 @@ data class Student(
     // Web-created roster rows use "section"; mobile uses "block". Keep both readable.
     val section: String = "",
     // Roster-only fields. block is looked up by scanned Student ID (never on the answer sheet);
-    // schoolYear distinguishes rosters imported across batches and is a Students/Records filter.
+    // schoolYear distinguishes roster imports from different academic years.
     val gender: String = "",
     // Optional contact email, used to send the student their result slip directly.
     val email: String = "",
@@ -39,5 +52,8 @@ data class Student(
 
 fun DocumentSnapshot.toStudentCompat(): Student? {
     val student = toObject(Student::class.java) ?: return null
-    return student.copy(block = student.block.ifBlank { student.section })
+    return student.copy(
+        block = student.block.ifBlank { student.section },
+        yearLevel = canonicalYearLevel(student.yearLevel),
+    )
 }

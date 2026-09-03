@@ -35,12 +35,22 @@ sealed interface Screen {
         }
     }
 
+    data object Handouts : Screen {
+        override val route = "handouts"
+        override val title = "Handouts"
+        override val icon: @Composable () -> Unit = {
+            Icon(Icons.Filled.Description, contentDescription = "Handouts", modifier = Modifier.size(24.dp))
+        }
+    }
+
     data object Subjects : Screen {
         override val route = "subjects"
         override val title = "Subjects"
         override val icon: @Composable () -> Unit = {
             Icon(Icons.AutoMirrored.Filled.List, contentDescription = "Subjects", modifier = Modifier.size(24.dp))
         }
+        fun createRoute(openClusters: Boolean = false): String =
+            if (openClusters) "$route?tab=clusters" else route
     }
 
     data object Exams : Screen {

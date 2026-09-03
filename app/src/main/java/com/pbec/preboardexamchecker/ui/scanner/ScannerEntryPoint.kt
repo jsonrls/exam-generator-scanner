@@ -36,7 +36,14 @@ fun ScannerEntryPoint(
 
     when (val s = state) {
         is ScanSessionState.Setup -> {
-            SessionSetupScreen(viewModel = viewModel)
+            SessionSetupScreen(
+                viewModel = viewModel,
+                onCreateCluster = {
+                    navController.navigate(
+                        com.pbec.preboardexamchecker.ui.Screen.Subjects.createRoute(openClusters = true)
+                    )
+                },
+            )
         }
 
         is ScanSessionState.Loading -> {
@@ -365,4 +372,3 @@ internal fun ResultAnswerGrid(
         }
     }
 }
-

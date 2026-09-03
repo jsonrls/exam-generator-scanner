@@ -2,70 +2,190 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
     <link rel="stylesheet" href="katex.min.css">
     <style>
-        body, html {
+        :root {
+            color-scheme: light dark;
+        }
+
+        html, body {
+            box-sizing: border-box;
+            width: 100%;
             margin: 0;
             padding: 0;
-            background: white;
+            background: transparent;
+            overflow: hidden;
+        }
+
+        body {
+            color: #111111;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             font-size: 10px;
-            line-height: 1.2;
-            overflow: visible;
+            line-height: 1.45;
         }
-        .katex {
-            font-size: 8px !important;
-            vertical-align: middle;
-            display: inline-block;
-            margin: 0 0.5px;
-            padding: 0.5px;
-            white-space: nowrap;
-            max-height: 16px;
-            overflow: visible;
-        }
+
         #latexOutput {
-            display: inline-block;
-            min-width: 10px;
-            min-height: 10px;
-            padding: 1px;
+            box-sizing: border-box;
+            display: block;
+            width: 100%;
+            min-height: 1px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
         }
-        .katex-error {
-            color: black !important;
-            font-family: Helvetica, sans-serif !important;
-            font-size: 8px !important;
+
+        .prose-segment {
+            white-space: pre-wrap;
+        }
+
+        .math-segment {
+            display: inline-block;
+            max-width: 100%;
+            overflow-x: auto;
+            overflow-y: hidden;
+            vertical-align: -0.16em;
+            scrollbar-width: none;
+        }
+
+        .math-segment::-webkit-scrollbar,
+        .katex-display::-webkit-scrollbar {
+            display: none;
+        }
+
+        .math-segment.display-math {
+            display: block;
+            margin: 0.3em 0;
+            text-align: center;
+            vertical-align: baseline;
+        }
+
+        .katex {
+            font-size: 1.05em;
+        }
+
+        .katex-display {
+            margin: 0;
+            overflow-x: auto;
+            overflow-y: hidden;
+        }
+
+        .render-fallback {
+            color: inherit;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-style: normal;
+            white-space: pre-wrap;
         }
     </style>
 </head>
 <body>
-<div id="latexOutput"></div>
+<div id="latexOutput" role="text"></div>
 <script defer src="katex.min.js"></script>
 <script>
-    window.androidCallback = {
-        render: function(latex, displayMode) {
-            try {
-                const output = document.getElementById('latexOutput');
-                output.innerHTML = '';
-                katex.render(latex, output, {
-                    throwOnError: true,
-                    displayMode: displayMode,
-                    output: 'html',
-                    strict: false
-                });
-                output.style.display = 'none';
-                output.offsetHeight;
-                output.style.display = 'inline-block';
-                setTimeout(() => {
-                    const rect = output.getBoundingClientRect();
-                    const width = Math.max(rect.width, 10);
-                    const height = Math.max(rect.height, 10);
-                    console.log(`js-callback://renderComplete?width=${width}&height=${height}`);
-                }, 50);
-            } catch (e) {
-                console.error('KaTeX render error: ' + e.message);
-                console.log(`js-callback://renderError?message=${encodeURIComponent(e.message)}`);
+    (function () {
+        const output = document.getElementById('latexOutput');
+
+        function reportHeight() {
+            const rect = output.getBoundingClientRect();
+            const height = Math.max(
+                1,
+                Math.ceil(rect.height),
+                Math.ceil(output.scrollHeight),
+                Math.ceil(document.body.scrollHeight)
+            );
+            if (window.AndroidMathBridge && window.AndroidMathBridge.reportHeight) {
+                window.AndroidMathBridge.reportHeight(height);
             }
         }
-    };
+
+        function scheduleHeightReport() {
+            requestAnimationFrame(function () {
+                reportHeight();
+                setTimeout(reportHeight, 60);
+            });
+            if (document.fonts && document.fonts.ready) {
+                document.fonts.ready.then(reportHeight);
+            }
+        }
+
+        function renderKatex(latex, target, displayMode) {
+            katex.render(latex, target, {
+                throwOnError: true,
+                displayMode: displayMode,
+                output: 'htmlAndMathml',
+                strict: 'ignore',
+                trust: false,
+            });
+        }
+
+        window.mathRenderer = {
+            render: function (segmentsJson, textColor, fontSizePixels) {
+                let segments;
+                try {
+                    segments = JSON.parse(segmentsJson);
+                } catch (error) {
+                    console.error('Math render error: invalid segment payload: ' + error.message);
+                    return;
+                }
+
+                output.replaceChildren();
+                output.style.color = textColor || '#111111';
+                document.body.style.color = textColor || '#111111';
+                document.body.style.fontSize = Math.max(12, Number(fontSizePixels) || 16) + 'px';
+
+                segments.forEach(function (segment) {
+                    if (segment.latex === null || segment.latex === undefined) {
+                        const prose = document.createElement('span');
+                        prose.className = 'prose-segment';
+                        prose.textContent = segment.source || '';
+                        output.appendChild(prose);
+                        return;
+                    }
+
+                    const math = document.createElement(segment.displayMode ? 'div' : 'span');
+                    math.className = segment.displayMode ? 'math-segment display-math' : 'math-segment';
+                    math.setAttribute('aria-label', segment.source || segment.latex);
+                    try {
+                        renderKatex(segment.latex, math, Boolean(segment.displayMode));
+                    } catch (error) {
+                        math.classList.add('render-fallback');
+                        math.textContent = segment.source || segment.latex;
+                        console.error('Math render error: ' + error.message + ' | source=' + (segment.source || ''));
+                    }
+                    output.appendChild(math);
+                });
+
+                scheduleHeightReport();
+            }
+        };
+
+        // Retained for PDF export, which renders one normalized formula to a bitmap.
+        window.androidCallback = {
+            render: function (latex, displayMode) {
+                output.replaceChildren();
+                document.body.style.fontSize = '10px';
+                try {
+                    renderKatex(latex, output, Boolean(displayMode));
+                    output.style.display = 'none';
+                    output.offsetHeight;
+                    output.style.display = 'block';
+                    setTimeout(function () {
+                        const rect = output.getBoundingClientRect();
+                        const width = Math.max(rect.width, 10);
+                        const height = Math.max(rect.height, 10);
+                        console.log('js-callback://renderComplete?width=' + width + '&height=' + height);
+                    }, 50);
+                } catch (error) {
+                    output.textContent = latex;
+                    console.error('Math render error: ' + error.message);
+                    console.log('js-callback://renderError?message=' + encodeURIComponent(error.message));
+                }
+            }
+        };
+
+        if (window.ResizeObserver) {
+            new ResizeObserver(reportHeight).observe(output);
+        }
+    }());
 </script>
 </body>
 </html>

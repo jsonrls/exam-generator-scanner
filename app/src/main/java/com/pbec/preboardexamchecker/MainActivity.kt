@@ -1,5 +1,6 @@
 package com.pbec.preboardexamchecker
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -60,6 +61,7 @@ import com.pbec.preboardexamchecker.ui.auth.LoginScreen
 import com.pbec.preboardexamchecker.ui.exams.ExamContentScreen
 import com.pbec.preboardexamchecker.ui.exams.ExamScreen
 import com.pbec.preboardexamchecker.ui.exambank.ImportSessionDetailsScreen
+import com.pbec.preboardexamchecker.ui.handouts.HandoutsScreen
 import com.pbec.preboardexamchecker.ui.onboarding.OnboardingScreen
 import androidx.activity.viewModels
 import com.pbec.preboardexamchecker.ui.scanner.ScanSettings
@@ -116,6 +118,7 @@ private val TAB_ROUTES = listOf(
 )
 
 // Tab owning the visible screen: topmost root on the stack, skipping details above it.
+@SuppressLint("RestrictedApi")
 private fun NavController.currentTabRoot(): String =
     currentBackStack.value.lastOrNull { it.destination.route?.substringBefore('?') in TAB_ROUTES }
         ?.destination?.route?.substringBefore('?') ?: Screen.Programs.route
@@ -291,6 +294,9 @@ fun App(
             composable(Screen.Programs.route) {
                 ProgramsScreen(navController = navController)
             }
+            composable(Screen.Handouts.route) {
+                HandoutsScreen(navController = navController)
+            }
             composable(Screen.Students.route) {
                 StudentsScreen(navController = navController)
             }
@@ -326,7 +332,18 @@ fun App(
             composable(Screen.EmailSettings.route) {
                 com.pbec.preboardexamchecker.ui.settings.EmailSettingsScreen(navController = navController)
             }
-            composable(Screen.Subjects.route) { SubjectsScreen(navController) }
+            composable(
+                route = "${Screen.Subjects.route}?tab={tab}",
+                arguments = listOf(navArgument("tab") {
+                    type = NavType.StringType
+                    defaultValue = "subjects"
+                }),
+            ) { backStackEntry ->
+                SubjectsScreen(
+                    navController = navController,
+                    initialPage = if (backStackEntry.arguments?.getString("tab") == "clusters") 1 else 0,
+                )
+            }
             composable(Screen.Exams.route) { backStackEntry ->
                 val subject = backStackEntry.arguments?.getString("subject") ?: "Unknown"
                 ExamScreen(navController, subject)

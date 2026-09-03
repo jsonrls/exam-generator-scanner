@@ -10,6 +10,7 @@ import com.pbec.preboardexamchecker.data.repository.ExamRepository
 import com.pbec.preboardexamchecker.data.repository.QuestionRepository
 import com.pbec.preboardexamchecker.data.repository.TransactionLogRepository
 import com.pbec.preboardexamchecker.utils.ExcelParser
+import com.google.firebase.auth.FirebaseAuth
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.SharingStarted
@@ -24,7 +25,6 @@ import javax.inject.Inject
 import kotlinx.coroutines.flow.stateIn
 import com.pbec.preboardexamchecker.data.models.ValidationResult
 import java.util.Locale
-import java.util.UUID
 
 @HiltViewModel
 class ExamBankViewModel @Inject constructor(
@@ -35,8 +35,16 @@ class ExamBankViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     savedStateHandle: SavedStateHandle
 ) : ViewModel() {
-    private fun isManualBankId(bankId: String): Boolean {
-        return bankId == "manual" || bankId.startsWith("manual_")
+    fun isDefaultBankId(bankId: String): Boolean =
+        QuestionRepository.isDefaultQuestionBankId(bankId)
+
+    val defaultQuestionBankId: String
+        get() = QuestionRepository.defaultQuestionBankId(subject)
+
+    fun canModifyQuestion(question: Question): Boolean {
+        if (question.isDefault) return false
+        val uid = FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+        return uid.isNotBlank() && question.uploadedByUid == uid
     }
 
     val subject: String = savedStateHandle.get<String>("subject") ?: "Unknown"
@@ -59,13 +67,9 @@ class ExamBankViewModel @Inject constructor(
     private val _nextQuestionToEdit = MutableStateFlow<Long?>(null)
     val nextQuestionToEdit: StateFlow<Long?> = _nextQuestionToEdit.asStateFlow()
 
-    private val _manualQuestionCount = MutableStateFlow(0)
-    val manualQuestionCount: StateFlow<Int> = _manualQuestionCount.asStateFlow()
-
     val questionsByImportSession: StateFlow<Map<String, List<Question>>> =
         questionRepository.getQuestionsBySubject(subject)
             .map { questions ->
-                _manualQuestionCount.value = questions.count { isManualBankId(it.questionBankId) }
                 questions.groupBy { it.questionBankId }
             }
             .stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
@@ -100,7 +104,6 @@ class ExamBankViewModel @Inject constructor(
             _isImporting.value = true
             try {
                 val importSessionId = System.currentTimeMillis()
-                val questionBankId = "bank_${UUID.randomUUID()}"
                 val extension = fileName.substringAfterLast(".").lowercase(Locale.ROOT)
                 
                 val parsedQuestions = if (extension == "csv") {
@@ -110,20 +113,32 @@ class ExamBankViewModel @Inject constructor(
                 }
 
                 if (parsedQuestions.isNotEmpty()) {
-                    val questionsToInsert = parsedQuestions.map { question ->
+                    val highestQuestionNumber = questionRepository
+                        .getAllQuestionsForSubjectOnce(subject)
+                        .maxOfOrNull { it.questionNumber }
+                        ?: 0
+                    val questionsToInsert = parsedQuestions.mapIndexed { index, question ->
                         question.copy(
                             // Question docs are keyed by id.toString(): a collision overwrites another question.
                             id = com.pbec.preboardexamchecker.utils.IdGenerator.newId(),
-                            questionBankId = questionBankId,
+                            questionNumber = highestQuestionNumber + index + 1,
+                            questionBankId = QuestionRepository.defaultQuestionBankId(subject),
                             importSessionId = importSessionId
                         )
                     }
-                    questionRepository.insertQuestions(questionsToInsert)
+                    val writtenCount = questionRepository.insertQuestions(questionsToInsert)
+                    val duplicateCount = questionsToInsert.size - writtenCount
                     logTransaction(
                         action = "IMPORT_QUESTION_BANK",
-                        details = "Imported ${questionsToInsert.size} questions from '$fileName' (sessionId=$importSessionId)."
+                        details = "Processed $writtenCount questions from '$fileName' " +
+                            "($duplicateCount duplicates skipped, sessionId=$importSessionId)."
                     )
-                    _message.value = "Successfully imported ${questionsToInsert.size} questions from $fileName."
+                    _message.value = if (writtenCount > 0) {
+                        "Processed $writtenCount questions from $fileName" +
+                            if (duplicateCount > 0) " ($duplicateCount duplicates skipped)." else "."
+                    } else {
+                        "No questions imported; every row already exists in this question bank."
+                    }
                 } else {
                     logTransaction(
                         action = "IMPORT_QUESTION_BANK_EMPTY",
@@ -166,6 +181,10 @@ class ExamBankViewModel @Inject constructor(
 
     fun saveQuestion(question: Question) {
         viewModelScope.launch {
+            if (question.id != 0L && !canModifyQuestion(question)) {
+                _message.value = "Default questions are read-only."
+                return@launch
+            }
             val validationResult = validateQuestion(question)
             if (!validationResult.isValid) {
                 _message.value = validationResult.errorMessage
@@ -173,7 +192,11 @@ class ExamBankViewModel @Inject constructor(
             }
             try {
                 val isNewQuestion = question.id == 0L
-                questionRepository.insertQuestions(listOf(question))
+                val writtenCount = questionRepository.insertQuestions(listOf(question))
+                if (writtenCount == 0) {
+                    _message.value = "That question already exists in this question bank."
+                    return@launch
+                }
                 logTransaction(
                     action = if (isNewQuestion) "ADD_QUESTION" else "UPDATE_QUESTION",
                     details = if (isNewQuestion) {
@@ -197,8 +220,8 @@ class ExamBankViewModel @Inject constructor(
     }
 
     fun deleteQuestion(question: Question) {
-        if (!isManualBankId(question.questionBankId)) {
-            deleteQuestionsForImportSession(question.questionBankId)
+        if (!canModifyQuestion(question)) {
+            _message.value = "Default questions cannot be deleted."
             return
         }
         viewModelScope.launch {
@@ -224,6 +247,10 @@ class ExamBankViewModel @Inject constructor(
     }
 
     fun deleteQuestionsForImportSession(questionBankId: String) {
+        if (isDefaultBankId(questionBankId)) {
+            _message.value = "The default question bank cannot be deleted."
+            return
+        }
         viewModelScope.launch {
             _isDeleting.value = true
             try {
@@ -265,6 +292,10 @@ class ExamBankViewModel @Inject constructor(
     }
 
     fun renameImportSession(questionBankId: String, newName: String) {
+        if (isDefaultBankId(questionBankId)) {
+            _message.value = "The default question bank cannot be renamed."
+            return
+        }
         viewModelScope.launch {
             try {
                 val updatedRows = questionRepository.updateCustomSessionNameByQuestionBankId(questionBankId, newName)

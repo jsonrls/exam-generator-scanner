@@ -9,6 +9,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.pbec.preboardexamchecker.data.models.ExamCluster
 import com.pbec.preboardexamchecker.data.models.Student
+import com.pbec.preboardexamchecker.data.models.canonicalYearLevel
 import com.pbec.preboardexamchecker.data.models.toStudentCompat
 import com.pbec.preboardexamchecker.data.repository.ExamClusterRepository
 import com.pbec.preboardexamchecker.data.repository.IScanResultRepository
@@ -67,14 +68,8 @@ class StudentsViewModel @Inject constructor(
     
     private val _searchQuery = MutableStateFlow("")
     val searchQuery = _searchQuery.asStateFlow()
-    private val _selectedYearLevel = MutableStateFlow("All")
-    val selectedYearLevel = _selectedYearLevel.asStateFlow()
     private val _selectedBlock = MutableStateFlow("All")
     val selectedBlock = _selectedBlock.asStateFlow()
-    private val _selectedCourse = MutableStateFlow("All")
-    val selectedCourse = _selectedCourse.asStateFlow()
-    private val _selectedSchoolYear = MutableStateFlow("All")
-    val selectedSchoolYear = _selectedSchoolYear.asStateFlow()
     private val _sort = MutableStateFlow(StudentSort.NAME_ASC)
     val sort = _sort.asStateFlow()
 
@@ -95,7 +90,6 @@ class StudentsViewModel @Inject constructor(
 
     private val _studentsState = MutableStateFlow<List<Student>>(emptyList())
     val studentsState: StateFlow<List<Student>> = _studentsState.asStateFlow()
-    val allStudents: StateFlow<List<Student>> = _students.asStateFlow()
 
     /** Distinct import batches present in the active roster, newest first (for delete-by-import). */
     val imports: StateFlow<List<ImportGroup>> = _students.map { list ->
@@ -109,24 +103,14 @@ class StudentsViewModel @Inject constructor(
         observeStudents()
         
         viewModelScope.launch {
-            // Two-stage combine: 5 filter flows fold into one selection, then apply to the list
-            // (combine's typed overload tops out at 5 arguments).
-            val selections = combine(
-                _searchQuery, _selectedBlock, _selectedCourse, _selectedSchoolYear, _selectedYearLevel
-            ) { query, block, course, schoolYear, yearLevel ->
-                Selections(query, block, course, schoolYear, yearLevel)
-            }
-            combine(_students, selections, _sort) { students, sel, sort ->
+            combine(_students, _searchQuery, _selectedBlock, _sort) { students, query, block, sort ->
                 val filtered = students.filter { student ->
-                    val queryMatch = sel.query.isBlank() ||
-                        student.name.contains(sel.query, ignoreCase = true) ||
-                        student.studentId.contains(sel.query, ignoreCase = true)
-                    val yearMatch = sel.yearLevel == "All" || student.yearLevel.equals(sel.yearLevel, ignoreCase = true)
-                    val blockMatch = sel.block == "All" || student.block.equals(sel.block, ignoreCase = true)
-                    val courseMatch = sel.course == "All" || student.program.equals(sel.course, ignoreCase = true)
-                    val schoolYearMatch = sel.schoolYear == "All" || student.schoolYear.equals(sel.schoolYear, ignoreCase = true)
+                    val queryMatch = query.isBlank() ||
+                        student.name.contains(query, ignoreCase = true) ||
+                        student.studentId.contains(query, ignoreCase = true)
+                    val blockMatch = block == "All" || normalizedBlock(student.block) == normalizedBlock(block)
 
-                    queryMatch && yearMatch && blockMatch && courseMatch && schoolYearMatch
+                    queryMatch && blockMatch
                 }
                 filtered.sortedWith(sort.comparator)
             }
@@ -137,14 +121,6 @@ class StudentsViewModel @Inject constructor(
                 }
         }
     }
-
-    private data class Selections(
-        val query: String,
-        val block: String,
-        val course: String,
-        val schoolYear: String,
-        val yearLevel: String,
-    )
 
     private fun observeStudents() {
         val currentUser = FirebaseAuth.getInstance().currentUser
@@ -188,20 +164,8 @@ class StudentsViewModel @Inject constructor(
         _searchQuery.value = query
     }
 
-    fun updateYearLevelFilter(yearLevel: String) {
-        _selectedYearLevel.value = yearLevel
-    }
-
     fun updateBlockFilter(block: String) {
         _selectedBlock.value = block
-    }
-
-    fun updateCourseFilter(course: String) {
-        _selectedCourse.value = course
-    }
-
-    fun updateSchoolYearFilter(schoolYear: String) {
-        _selectedSchoolYear.value = schoolYear
     }
 
     fun updateSort(sort: StudentSort) {
@@ -209,10 +173,7 @@ class StudentsViewModel @Inject constructor(
     }
 
     fun clearFilters() {
-        _selectedYearLevel.value = "All"
         _selectedBlock.value = "All"
-        _selectedCourse.value = "All"
-        _selectedSchoolYear.value = "All"
     }
 
     /**
@@ -266,7 +227,7 @@ class StudentsViewModel @Inject constructor(
                         "section" to rs.block,
                         "email" to rs.email,
                         "program" to rs.program,
-                        "yearLevel" to "4",
+                        "yearLevel" to "4th Year",
                         "gender" to rs.gender,
                         "schoolYear" to rs.schoolYear,
                         "instructor" to rs.instructor,
@@ -397,7 +358,7 @@ class StudentsViewModel @Inject constructor(
             "name" to name,
             "studentId" to studentId,
             "program" to program,
-            "yearLevel" to yearLevel,
+            "yearLevel" to canonicalYearLevel(yearLevel),
             "block" to block,
             "section" to block,
             "email" to email,
@@ -420,7 +381,7 @@ class StudentsViewModel @Inject constructor(
             "name" to name,
             "studentId" to studentId,
             "program" to program,
-            "yearLevel" to yearLevel,
+            "yearLevel" to canonicalYearLevel(yearLevel),
             "block" to block,
             "section" to block,
             "email" to email
@@ -444,6 +405,9 @@ class StudentsViewModel @Inject constructor(
 enum class StudentSort(val label: String, val comparator: Comparator<Student>) {
     NAME_ASC("Name (A–Z)", compareBy { it.name.lowercase() }),
     NAME_DESC("Name (Z–A)", compareByDescending { it.name.lowercase() }),
-    ID_ASC("Student ID", compareBy { it.studentId }),
-    BLOCK_ASC("Block", compareBy({ it.block.lowercase() }, { it.name.lowercase() })),
 }
+
+private val blockPrefix = Regex("^block\\s+", RegexOption.IGNORE_CASE)
+
+private fun normalizedBlock(value: String): String =
+    value.trim().replace(blockPrefix, "").uppercase()

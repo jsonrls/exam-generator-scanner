@@ -39,10 +39,13 @@ private val SUBJECTS = listOf("Mathematics", "ESAS", "Professional EE")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SubjectsScreen(navController: NavController) {
+fun SubjectsScreen(
+    navController: NavController,
+    initialPage: Int = 0,
+) {
     val scope = rememberCoroutineScope()
     // Two swipeable tabs: 0 = the three subjects, 1 = Exam Clusters (span all subjects).
-    val pagerState = rememberPagerState(initialPage = 0) { 2 }
+    val pagerState = rememberPagerState(initialPage = initialPage.coerceIn(0, 1)) { 2 }
 
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),

@@ -5,15 +5,14 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
+        <!-- Android Keystore keys are device-bound, so this encrypted file cannot be restored safely. -->
+        <exclude domain="sharedpref" path="email_prefs.xml"/>
         <!-- TODO: Use <include> and <exclude> to control what is backed up.
         <include .../>
         <exclude .../>
         -->
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="email_prefs.xml"/>
     </device-transfer>
-    -->
 </data-extraction-rules>

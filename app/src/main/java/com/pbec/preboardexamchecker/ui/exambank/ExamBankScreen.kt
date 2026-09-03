@@ -56,7 +56,6 @@ fun ExamBankContent(
     val questionsByImportSession by viewModel.questionsByImportSession.collectAsState()
     val generatedExamCountsByImportSession by viewModel.generatedExamCountsByImportSession.collectAsState()
     val nextQuestionToEditId by viewModel.nextQuestionToEdit.collectAsState()
-    val manualQuestionCount by viewModel.manualQuestionCount.collectAsState()
     val isDeleting by viewModel.isDeleting.collectAsState()
     val isImporting by viewModel.isImporting.collectAsState()
 
@@ -92,9 +91,12 @@ fun ExamBankContent(
 
     val sortedImportSessionIds = remember(questionsByImportSession.keys) {
         val sessionKeys = questionsByImportSession.keys
+        val defaultSession = sessionKeys.filter(viewModel::isDefaultBankId)
         val manualSession = sessionKeys.filter { it == "manual" || it.startsWith("manual_") }
-        val importedSessions = sessionKeys.filter { it != "manual" && !it.startsWith("manual_") }.sortedDescending()
-        importedSessions + manualSession
+        val importedSessions = sessionKeys.filter {
+            !viewModel.isDefaultBankId(it) && it != "manual" && !it.startsWith("manual_")
+        }.sortedDescending()
+        defaultSession + importedSessions + manualSession
     }
 
     LaunchedEffect(message) {
@@ -190,14 +192,15 @@ fun ExamBankContent(
                 ) {
                     items(sortedImportSessionIds, key = { it }) { importSessionId ->
                         val questionsInSession = questionsByImportSession[importSessionId] ?: emptyList()
+                        val isDefaultSession = viewModel.isDefaultBankId(importSessionId)
                         val isManualSession = importSessionId == "manual" || importSessionId.startsWith("manual_")
 
                         if (!(isManualSession && questionsInSession.isEmpty())) {
                             val firstQuestion = questionsInSession.firstOrNull()
-                            val headerText = if (isManualSession) {
-                                "Manually Added"
-                            } else {
-                                firstQuestion?.customSessionName ?: firstQuestion?.fileName ?: "Imported File"
+                            val headerText = when {
+                                isDefaultSession -> "Default Question Bank"
+                                isManualSession -> "Manually Added"
+                                else -> firstQuestion?.customSessionName ?: firstQuestion?.fileName ?: "Imported File"
                             }
 
                             Card(
@@ -259,7 +262,8 @@ fun ExamBankContent(
                                         }
                                     }
                                     
-                                    Row {
+                                    if (!isDefaultSession) {
+                                        Row {
                                         if (!isManualSession) {
                                             IconButton(
                                                 onClick = {
@@ -292,6 +296,7 @@ fun ExamBankContent(
                                                 tint = MaterialTheme.colorScheme.onPrimaryContainer
                                             )
                                         }
+                                        }
                                     }
                                 }
                             }
@@ -309,15 +314,17 @@ fun ExamBankContent(
                                     currentlyEditingQuestionId = null
                                     newQuestionDraft = Question(
                                         subject = subject,
-                                        fileName = "Manually Added",
-                                        questionNumber = (manualQuestionCount + 1),
+                                        fileName = "Teacher Added",
+                                        questionNumber = (questionsByImportSession.values
+                                            .flatten()
+                                            .maxOfOrNull { it.questionNumber } ?: 0) + 1,
                                         questionText = "",
                                         optionA = "",
                                         optionB = "",
                                         optionC = "",
                                         optionD = "",
                                         correctAnswer = null,
-                                        questionBankId = "manual_${subject.lowercase(Locale.ROOT).replace(" ", "_")}",
+                                        questionBankId = viewModel.defaultQuestionBankId,
                                         importSessionId = 0L
                                     )
                                 },

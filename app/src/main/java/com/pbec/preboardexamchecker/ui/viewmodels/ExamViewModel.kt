@@ -22,7 +22,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
 import javax.inject.Inject
 import kotlin.random.Random
 
@@ -288,7 +287,7 @@ class ExamViewModel @Inject constructor(
                 val questions = excelParser.readQuestionsFromExcel(context, uri, selectedSubject, fileName)
                 if (questions.isNotEmpty()) {
                     val importSessionId = System.currentTimeMillis()
-                    val questionBankId = "bank_${UUID.randomUUID()}"
+                    val questionBankId = QuestionRepository.defaultQuestionBankId(selectedSubject)
                     val questionsToInsert = questions.map {
                         it.copy(
                             // Question docs are keyed by id.toString(): a collision overwrites another question.
@@ -297,8 +296,14 @@ class ExamViewModel @Inject constructor(
                             importSessionId = importSessionId
                         )
                     }
-                    questionRepository.insertQuestions(questionsToInsert)
-                    _message.value = "Successfully imported ${questions.size} questions."
+                    val writtenCount = questionRepository.insertQuestions(questionsToInsert)
+                    val duplicateCount = questionsToInsert.size - writtenCount
+                    _message.value = if (writtenCount > 0) {
+                        "Processed $writtenCount questions" +
+                            if (duplicateCount > 0) " ($duplicateCount duplicates skipped)." else "."
+                    } else {
+                        "No questions imported; every row already exists in this question bank."
+                    }
                 } else {
                     _message.value = "No valid questions found."
                 }

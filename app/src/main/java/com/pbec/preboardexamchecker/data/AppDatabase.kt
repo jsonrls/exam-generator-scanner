@@ -18,7 +18,7 @@ import com.pbec.preboardexamchecker.data.models.Question
 import com.pbec.preboardexamchecker.data.models.ScanResult
 import com.pbec.preboardexamchecker.data.models.TransactionLog
 
-@Database(entities = [Question::class, Exam::class, TransactionLog::class, ScanResult::class], version = 11, exportSchema = true)
+@Database(entities = [Question::class, Exam::class, TransactionLog::class, ScanResult::class], version = 13, exportSchema = true)
 @TypeConverters(ListLongConverter::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun questionDao(): QuestionDao
@@ -30,7 +30,7 @@ abstract class AppDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
-        // v1→v11 chain, derived from the exported schemas in app/schemas. No destructive
+        // v1→v13 chain, derived from the exported schemas in app/schemas. No destructive
         // fallback: scan_results is the only copy of graded exams, so a bad migration must throw.
 
         /** Schema unchanged. */
@@ -117,6 +117,21 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** v11 → v12: retain Firestore ownership metadata when questions pass through Room. */
+        private val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE questions ADD COLUMN isDefault INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE questions ADD COLUMN uploadedByTeacherId TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        /** v12 → v13: retain the authenticated Firebase owner used by server-side rules. */
+        private val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE questions ADD COLUMN uploadedByUid TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         fun getDatabase(context: Context, gson: Gson): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -128,7 +143,8 @@ abstract class AppDatabase : RoomDatabase() {
                     .addMigrations(
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8,
-                        MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11
+                        MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
+                        MIGRATION_12_13
                     )
                     .build()
                 INSTANCE = instance

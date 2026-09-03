@@ -3,6 +3,7 @@ package com.pbec.preboardexamchecker.ui.auth
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import com.google.firebase.Timestamp
+import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
@@ -58,6 +59,7 @@ class AuthViewModel @Inject constructor(
                         validatePasswordAndStartSession(
                             teacherDocument = teacherSnapshot.documents.firstOrNull(),
                             hashedInputPassword = hashedInputPassword,
+                            password = password.trim(),
                             onSuccess = onSuccess
                         )
                         return@addOnSuccessListener
@@ -68,16 +70,17 @@ class AuthViewModel @Inject constructor(
                         .whereEqualTo("instructorId", normalizedInstructorId)
                         .limit(1)
                         .get()
-                        .addOnSuccessListener { instructorSnapshot ->
+                        .addOnSuccessListener instructorLookup@ { instructorSnapshot ->
                             if (instructorSnapshot.isEmpty) {
                                 _isLoading.value = false
                                 _errorMessage.value = "Teacher ID not found."
-                                return@addOnSuccessListener
+                                return@instructorLookup
                             }
 
                             validatePasswordAndStartSession(
                                 teacherDocument = instructorSnapshot.documents.firstOrNull(),
                                 hashedInputPassword = hashedInputPassword,
+                                password = password.trim(),
                                 onSuccess = onSuccess
                             )
                         }
@@ -128,39 +131,53 @@ class AuthViewModel @Inject constructor(
                         val hashedPassword = sha256(defaultPassword)
                         val now = Timestamp.now()
                         val activationDeadline = Timestamp(java.util.Date(now.toDate().time + 7L * 24 * 60 * 60 * 1000))
-                        val uid = auth.currentUser?.uid
-                        if (uid.isNullOrBlank()) {
+                        val anonymousUser = auth.currentUser
+                        if (anonymousUser == null) {
                             _isLoading.value = false
                             _errorMessage.value = "Session missing. Please try again."
                             return@generateTeacherId
                         }
-                        firestore.collection("users")
-                            .document(uid)
-                            .set(
-                                mapOf(
-                                    "teacherId" to generatedTeacherId,
-                                    "name" to fullName.trim(),
-                                    "school" to school.trim(),
-                                    "position" to position.trim(),
-                                    "department" to position.trim(),
-                                    "email" to email.trim(),
-                                    "passwordHash" to hashedPassword,
-                                    "role" to "teacher",
-                                    "isActive" to false,
-                                    "status" to "inactive",
-                                    "activationDeadline" to activationDeadline,
-                                    "createdAt" to now,
-                                    "updatedAt" to now
-                                )
-                            )
-                            .addOnSuccessListener {
-                                _isLoading.value = false
-                                _errorMessage.value = null
-                                onSuccess(generatedTeacherId, defaultPassword)
+                        val credential = EmailAuthProvider.getCredential(email.trim(), defaultPassword)
+                        anonymousUser.linkWithCredential(credential)
+                            .addOnSuccessListener linkSuccess@ { result ->
+                                val uid = result.user?.uid
+                                if (uid.isNullOrBlank()) {
+                                    _isLoading.value = false
+                                    _errorMessage.value = "Account creation failed: missing authenticated user."
+                                    return@linkSuccess
+                                }
+                                firestore.collection("users")
+                                    .document(uid)
+                                    .set(
+                                        mapOf(
+                                            "teacherId" to generatedTeacherId,
+                                            "name" to fullName.trim(),
+                                            "school" to school.trim(),
+                                            "position" to position.trim(),
+                                            "department" to position.trim(),
+                                            "email" to email.trim(),
+                                            "passwordHash" to hashedPassword,
+                                            "role" to "teacher",
+                                            "isActive" to false,
+                                            "status" to "inactive",
+                                            "activationDeadline" to activationDeadline,
+                                            "createdAt" to now,
+                                            "updatedAt" to now
+                                        )
+                                    )
+                                    .addOnSuccessListener {
+                                        _isLoading.value = false
+                                        _errorMessage.value = null
+                                        onSuccess(generatedTeacherId, defaultPassword)
+                                    }
+                                    .addOnFailureListener { error ->
+                                        _isLoading.value = false
+                                        _errorMessage.value = "Cannot create teacher account: ${error.message}"
+                                    }
                             }
                             .addOnFailureListener { error ->
                                 _isLoading.value = false
-                                _errorMessage.value = "Cannot create teacher account: ${error.message}"
+                                _errorMessage.value = firebaseAuthErrorMessage(error)
                             }
                     }
                 }
@@ -174,6 +191,7 @@ class AuthViewModel @Inject constructor(
     private fun validatePasswordAndStartSession(
         teacherDocument: DocumentSnapshot?,
         hashedInputPassword: String,
+        password: String,
         onSuccess: () -> Unit
     ) {
         val snapshotHash = teacherDocument?.getString("passwordHash")
@@ -196,10 +214,30 @@ class AuthViewModel @Inject constructor(
             _errorMessage.value = "Account is inactive and pending admin activation.$deadlineMessage"
             return
         }
-        teacherDocument?.let { persistTeacherSession(it) }
-        _isLoading.value = false
-        _errorMessage.value = null
-        onSuccess()
+        val email = teacherDocument.getString("email").orEmpty().trim()
+        if (email.isBlank()) {
+            _isLoading.value = false
+            _errorMessage.value = "Teacher account has no Firebase Auth email. Contact an administrator."
+            return
+        }
+
+        auth.signInWithEmailAndPassword(email, password)
+            .addOnSuccessListener { result ->
+                if (result.user?.uid != teacherDocument.id) {
+                    auth.signOut()
+                    _isLoading.value = false
+                    _errorMessage.value = "Teacher account identity does not match its profile. Contact an administrator."
+                    return@addOnSuccessListener
+                }
+                persistTeacherSession(teacherDocument)
+                _isLoading.value = false
+                _errorMessage.value = null
+                onSuccess()
+            }
+            .addOnFailureListener { error ->
+                _isLoading.value = false
+                _errorMessage.value = "Firebase account sign-in failed: ${error.message}. Contact an administrator if your password was reset."
+            }
     }
 
     private fun ensureFirebaseSession(onReady: () -> Unit) {
@@ -215,8 +253,17 @@ class AuthViewModel @Inject constructor(
             }
             .addOnFailureListener { error ->
                 _isLoading.value = false
-                _errorMessage.value = "Firebase auth failed: ${error.message}. Enable Anonymous auth in Firebase."
+                _errorMessage.value = firebaseAuthErrorMessage(error)
             }
+    }
+
+    private fun firebaseAuthErrorMessage(error: Exception): String {
+        val message = error.message?.takeIf { it.isNotBlank() } ?: "Unknown error"
+        return if (message.contains("API key expired", ignoreCase = true)) {
+            "Firebase auth failed: API key expired. Replace app/google-services.json with the latest Firebase config and rebuild the app."
+        } else {
+            "Firebase auth failed: $message. Check that Anonymous auth is enabled in Firebase."
+        }
     }
 
     private fun sha256(value: String): String {

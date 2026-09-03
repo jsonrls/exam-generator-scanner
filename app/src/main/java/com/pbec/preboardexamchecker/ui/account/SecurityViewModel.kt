@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.Timestamp
+import com.google.firebase.auth.EmailAuthProvider
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -74,21 +76,43 @@ class SecurityViewModel @Inject constructor(
                 return@lookupTeacherDocument
             }
 
-            teacherDocument.reference
-                .update(
-                    mapOf(
-                        "passwordHash" to sha256(newPassword.trim()),
-                        "updatedAt" to Timestamp.now()
-                    )
-                )
+            val authUser = FirebaseAuth.getInstance().currentUser
+            val email = authUser?.email ?: teacherDocument.getString("email")
+            if (authUser == null || email.isNullOrBlank() || authUser.uid != teacherDocument.id) {
+                _isUpdatingPassword.value = false
+                _uiEvent.tryEmit(UiEvent.ShowSnackbar("Authenticated teacher account not found. Please login again."))
+                return@lookupTeacherDocument
+            }
+
+            authUser.reauthenticate(EmailAuthProvider.getCredential(email, currentPassword.trim()))
                 .addOnSuccessListener {
-                    _isUpdatingPassword.value = false
-                    _uiEvent.tryEmit(UiEvent.ShowSnackbar("Password updated successfully."))
-                    onSuccess()
+                    authUser.updatePassword(newPassword.trim())
+                        .addOnSuccessListener {
+                            teacherDocument.reference
+                                .update(
+                                    mapOf(
+                                        "passwordHash" to sha256(newPassword.trim()),
+                                        "updatedAt" to Timestamp.now()
+                                    )
+                                )
+                                .addOnSuccessListener {
+                                    _isUpdatingPassword.value = false
+                                    _uiEvent.tryEmit(UiEvent.ShowSnackbar("Password updated successfully."))
+                                    onSuccess()
+                                }
+                                .addOnFailureListener { error ->
+                                    _isUpdatingPassword.value = false
+                                    _uiEvent.tryEmit(UiEvent.ShowSnackbar("Password changed in Firebase Auth, but profile sync failed: ${error.message}"))
+                                }
+                        }
+                        .addOnFailureListener { error ->
+                            _isUpdatingPassword.value = false
+                            _uiEvent.tryEmit(UiEvent.ShowSnackbar("Failed to update password: ${error.message}"))
+                        }
                 }
-                .addOnFailureListener { error ->
+                .addOnFailureListener {
                     _isUpdatingPassword.value = false
-                    _uiEvent.tryEmit(UiEvent.ShowSnackbar("Failed to update password: ${error.message}"))
+                    _uiEvent.tryEmit(UiEvent.ShowSnackbar("Current password is incorrect."))
                 }
         }
     }

@@ -2,8 +2,11 @@ package com.pbec.preboardexamchecker.domain.email
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.io.IOException
+import java.security.GeneralSecurityException
 
 /** SMTP provider presets so the instructor never has to know host/port (except "Other"). */
 enum class EmailProvider(val label: String, val host: String, val port: Int) {
@@ -15,7 +18,16 @@ enum class EmailProvider(val label: String, val host: String, val port: Int) {
     YAHOO("Yahoo", "smtp.mail.yahoo.com", 465),
     // Office 365 only serves STARTTLS on 587 — it has no implicit-SSL listener.
     OUTLOOK("Outlook", "smtp.office365.com", 587),
+    MAILEROO("Maileroo", "smtp.maileroo.com", 465),
     OTHER("Other", "", 0),
+}
+
+/** Non-secret PBEC defaults for the verified Maileroo sending domain. */
+object MailerooDefaults {
+    const val FROM_ADDRESS = "results@f3999e9e64838d10.maileroo.org"
+    const val SENDER_NAME = "PBEC Results"
+    const val REPLY_TO_ADDRESS = "jhonreyreviewer101@gmail.com"
+    const val TEST_RECIPIENT = "jaysonreales0@gmail.com"
 }
 
 /**
@@ -23,9 +35,11 @@ enum class EmailProvider(val label: String, val host: String, val port: Int) {
  * is stored in [EncryptedSharedPreferences] (encrypted at rest, never hardcoded in the APK).
  */
 data class EmailConfig(
-    val provider: EmailProvider = EmailProvider.GMAIL,
-    val fromAddress: String = "",
-    val senderName: String = "",
+    val provider: EmailProvider = EmailProvider.MAILEROO,
+    val fromAddress: String = MailerooDefaults.FROM_ADDRESS,
+    val senderName: String = MailerooDefaults.SENDER_NAME,
+    val replyToAddress: String = MailerooDefaults.REPLY_TO_ADDRESS,
+    val testRecipient: String = MailerooDefaults.TEST_RECIPIENT,
     val password: String = "",
     // Only used when provider == OTHER.
     val customHost: String = "",
@@ -33,6 +47,8 @@ data class EmailConfig(
 ) {
     val host: String get() = if (provider == EmailProvider.OTHER) customHost else provider.host
     val port: Int get() = if (provider == EmailProvider.OTHER) customPort else provider.port
+    val testRecipientAddress: String
+        get() = testRecipient.ifBlank { replyToAddress }.ifBlank { fromAddress }
     /** Ready to send once we have a from-address, a password, and a resolvable host. */
     val isConfigured: Boolean
         get() = fromAddress.isNotBlank() && password.isNotBlank() && host.isNotBlank() && port > 0
@@ -43,6 +59,8 @@ object EmailSettings {
     private const val KEY_PROVIDER = "provider"
     private const val KEY_FROM = "from_address"
     private const val KEY_SENDER_NAME = "sender_name"
+    private const val KEY_REPLY_TO = "reply_to_address"
+    private const val KEY_TEST_RECIPIENT = "test_recipient"
     private const val KEY_PASSWORD = "app_password"
     private const val KEY_HOST = "custom_host"
     private const val KEY_PORT = "custom_port"
@@ -51,29 +69,63 @@ object EmailSettings {
     @Volatile
     private var cached: SharedPreferences? = null
 
+    private fun createPrefs(context: Context): SharedPreferences {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        return EncryptedSharedPreferences.create(
+            context,
+            PREFS,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        )
+    }
+
+    /**
+     * Encrypted preference keysets cannot be restored onto a device whose Android Keystore key is
+     * different. That file is unreadable permanently, so recreate only the email-settings store
+     * instead of crashing the Settings screen.
+     */
+    private fun createOrRepairPrefs(context: Context): SharedPreferences = try {
+        createPrefs(context)
+    } catch (e: GeneralSecurityException) {
+        Log.w("EmailSettings", "Recreating unreadable encrypted email preferences", e)
+        context.deleteSharedPreferences(PREFS)
+        createPrefs(context)
+    } catch (e: IOException) {
+        Log.w("EmailSettings", "Recreating unreadable encrypted email preferences", e)
+        context.deleteSharedPreferences(PREFS)
+        createPrefs(context)
+    }
+
     private fun prefs(context: Context): SharedPreferences = cached ?: synchronized(this) {
-        cached ?: run {
-            val masterKey = MasterKey.Builder(context.applicationContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context.applicationContext,
-                PREFS,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            ).also { cached = it }
-        }
+        cached ?: createOrRepairPrefs(context.applicationContext).also { cached = it }
     }
 
     fun load(context: Context): EmailConfig {
         val p = prefs(context)
-        val provider = runCatching { EmailProvider.valueOf(p.getString(KEY_PROVIDER, null) ?: "GMAIL") }
-            .getOrDefault(EmailProvider.GMAIL)
+        val provider = runCatching { EmailProvider.valueOf(p.getString(KEY_PROVIDER, null) ?: "MAILEROO") }
+            .getOrDefault(EmailProvider.MAILEROO)
+        val maileroo = provider == EmailProvider.MAILEROO
         return EmailConfig(
             provider = provider,
-            fromAddress = p.getString(KEY_FROM, "").orEmpty(),
-            senderName = p.getString(KEY_SENDER_NAME, "").orEmpty(),
+            fromAddress = p.getString(
+                KEY_FROM,
+                if (maileroo) MailerooDefaults.FROM_ADDRESS else "",
+            ).orEmpty(),
+            senderName = p.getString(
+                KEY_SENDER_NAME,
+                if (maileroo) MailerooDefaults.SENDER_NAME else "",
+            ).orEmpty(),
+            replyToAddress = p.getString(
+                KEY_REPLY_TO,
+                if (maileroo) MailerooDefaults.REPLY_TO_ADDRESS else "",
+            ).orEmpty(),
+            testRecipient = p.getString(
+                KEY_TEST_RECIPIENT,
+                if (maileroo) MailerooDefaults.TEST_RECIPIENT else "",
+            ).orEmpty(),
             password = p.getString(KEY_PASSWORD, "").orEmpty(),
             customHost = p.getString(KEY_HOST, "").orEmpty(),
             customPort = p.getInt(KEY_PORT, 587),
@@ -85,6 +137,8 @@ object EmailSettings {
             .putString(KEY_PROVIDER, config.provider.name)
             .putString(KEY_FROM, config.fromAddress.trim())
             .putString(KEY_SENDER_NAME, config.senderName.trim())
+            .putString(KEY_REPLY_TO, config.replyToAddress.trim())
+            .putString(KEY_TEST_RECIPIENT, config.testRecipient.trim())
             .putString(KEY_PASSWORD, config.password)
             .putString(KEY_HOST, config.customHost.trim())
             .putInt(KEY_PORT, config.customPort)
