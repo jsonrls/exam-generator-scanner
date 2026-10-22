@@ -104,7 +104,7 @@ class InfoZoneProcessor(
 
     fun process(
         bitmap: Bitmap,
-        studentMap: Map<String, com.pbec.preboardexamchecker.data.models.Student>,
+        students: List<com.pbec.preboardexamchecker.data.models.Student>,
         cornerHints: Array<Point?>? = null,
         debugContext: android.content.Context? = null
     ): Result {
@@ -212,7 +212,7 @@ class InfoZoneProcessor(
             return Result.Error("Could not find registration markers in info zone")
         }
 
-        val result = readWarpedZone(cellEnhanced, cellEnhancedNeutral, markers, studentMap, debugContext)
+        val result = readWarpedZone(cellEnhanced, cellEnhancedNeutral, markers, students, debugContext)
         cellEnhanced.release()
         cellEnhancedNeutral.release()
         return result
@@ -228,7 +228,7 @@ class InfoZoneProcessor(
         cellEnhanced: Mat,
         cellEnhancedNeutral: Mat,
         markers: List<Point>,
-        studentMap: Map<String, com.pbec.preboardexamchecker.data.models.Student>,
+        students: List<com.pbec.preboardexamchecker.data.models.Student>,
         debugContext: android.content.Context? = null
     ): Result {
         val warpedGray = perspectiveCorrector.warp(
@@ -405,10 +405,15 @@ class InfoZoneProcessor(
         testBoxWarp.release()
         testBoxBinary.release()
 
-        val resolvedStudent = studentMap[studentId]
+        val resolvedStudent = when (val match = StudentIdMatcher.resolve(studentId, students)) {
+            is StudentIdMatcher.Match.Found -> match.student
+            StudentIdMatcher.Match.Invalid -> return Result.Error("Student ID is incomplete. Shade one digit in each of the six columns and scan again.")
+            StudentIdMatcher.Match.Ambiguous -> return Result.Error("Multiple roster entries match this Student ID. Resolve the duplicate roster entries before scanning again.")
+            StudentIdMatcher.Match.NotFound -> null
+        }
         return Result.Success(ScannedInfo(
             testSet = testSet,
-            studentId = studentId,
+            studentId = resolvedStudent?.studentId ?: studentId,
             resolvedStudent = resolvedStudent
         ))
     }

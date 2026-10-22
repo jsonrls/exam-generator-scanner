@@ -13,14 +13,18 @@ import com.pbec.preboardexamchecker.data.repository.ExamRepository
 import com.pbec.preboardexamchecker.data.repository.IScanResultRepository
 import com.pbec.preboardexamchecker.data.repository.QuestionRepository
 import com.pbec.preboardexamchecker.data.repository.ScanResultRepository
+import com.pbec.preboardexamchecker.ui.viewmodels.reportLoadErrors
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.tasks.await
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -39,14 +43,21 @@ class TrashViewModel @Inject constructor(
     private val firestore: FirebaseFirestore,
 ) : ViewModel() {
 
+    private val _message = MutableStateFlow<String?>(null)
+    val message: StateFlow<String?> = _message.asStateFlow()
+
     val trashed: StateFlow<List<ScanResult>> =
         repository.getTrashed().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val trashedExams: StateFlow<List<TrashedExam>> =
-        examRepository.getTrashedExams().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+        examRepository.getTrashedExams()
+            .reportLoadErrors("Unable to load deleted exams") { _message.value = it }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val trashedBanks: StateFlow<List<TrashedBank>> =
-        questionRepository.getTrashedBanks().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+        questionRepository.getTrashedBanks()
+            .reportLoadErrors("Unable to load deleted question banks") { _message.value = it }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /** All trashed students (Firestore can't query deletedAt != null without an index, so filter
      *  client-side). Split downstream into whole-import groups vs individually-deleted students. */
@@ -93,13 +104,27 @@ class TrashViewModel @Inject constructor(
 
     // ---- exams (cascade: the exam's records travel with it) ----
     fun restoreExam(examId: Long) = viewModelScope.launch {
-        examRepository.restoreExam(examId)
-        runCatching { repository.restoreExamCascade(examId) }
+        try {
+            examRepository.restoreExam(examId)
+            runCatching { repository.restoreExamCascade(examId) }
+                .onFailure { if (it is CancellationException) throw it }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            _message.value = "Unable to restore exam: ${error.message}"
+        }
     }
 
     fun deleteExamForever(examId: Long) = viewModelScope.launch {
-        examRepository.purgeExam(examId)
-        runCatching { repository.purgeExamCascade(examId) }
+        try {
+            examRepository.purgeExam(examId)
+            runCatching { repository.purgeExamCascade(examId) }
+                .onFailure { if (it is CancellationException) throw it }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            _message.value = "Unable to delete exam: ${error.message}"
+        }
     }
 
     // ---- exam banks (restore/purge spans both repos so the bank's exams travel with it) ----

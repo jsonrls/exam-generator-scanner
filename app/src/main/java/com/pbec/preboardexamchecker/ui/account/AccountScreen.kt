@@ -15,6 +15,11 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import android.content.SharedPreferences
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -34,7 +39,14 @@ fun AccountScreen(navController: NavController) {
     val context = LocalContext.current
     val sharedPreferences = remember(context) { context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE) }
     val teacherName = remember(sharedPreferences) { sharedPreferences.getString("teacher_name", "Teacher") ?: "Teacher" }
-    val teacherEmail = remember(sharedPreferences) { sharedPreferences.getString("teacher_email", "") ?: "" }
+    var teacherEmail by remember(sharedPreferences) { mutableStateOf(sharedPreferences.getString("teacher_email", "") ?: "") }
+    DisposableEffect(sharedPreferences) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { preferences, key ->
+            if (key == "teacher_email") teacherEmail = preferences.getString(key, "").orEmpty()
+        }
+        sharedPreferences.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { sharedPreferences.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
     val teacherId = remember(sharedPreferences) { sharedPreferences.getString("teacher_id", "N/A") ?: "N/A" }
     val teacherDepartment = remember(sharedPreferences) { sharedPreferences.getString("teacher_department", "") ?: "" }
     val teacherSchool = remember(sharedPreferences) { sharedPreferences.getString("teacher_school", "") ?: "" }
@@ -127,8 +139,8 @@ fun AccountScreen(navController: NavController) {
             ) {
                 AccountMenuItem(
                     icon = Icons.Default.Shield,
-                    title = "Security",
-                    subtitle = "Password and authentication",
+                    title = "Account security",
+                    subtitle = "Password, email and authentication",
                     onClick = { navController.navigate(Screen.Security.route) }
                 )
             }

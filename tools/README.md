@@ -43,7 +43,7 @@ before running.
 | `subj_e2e.py` | End-to-end subject read (gap-edge localization + read rects) on rectified strips. | strip set (path hardcoded in script) |
 | `newsub_e2e.py`, `newsub_e2e2.py` | Newest subject regression set (3/52 bad-warp cases still open). | capture set (path hardcoded in script) |
 | `cell_center_error.py` | Per-cell alignment regression metric for the per-column curve-rectify refinement. | misaligned/blurry capture sets (paths hardcoded in script) |
-| `blur_metrics.py` | Content blur-gate floor (`ANSWER_BLUR_VARIANCE_MIN`). Gate is now enabled (=300); kept for re-calibration. | blurry + sharp capture sets (paths hardcoded in script) |
+| `blur_metrics.py` | Content blur-gate calibration (`ANSWER_BLUR_VARIANCE_MIN`). Rejection is disabled until validated against real captures; variance is diagnostic. | blurry + sharp capture sets (paths hardcoded in script) |
 | `coons_info_proto.py` | Coons curve-rectify prototype for the ID/TEST-SET boxes (`CurveRectifier.rectifyGray`); info-box dewarp still being hardened. | clean info warps (path hardcoded in script) |
 
 ---

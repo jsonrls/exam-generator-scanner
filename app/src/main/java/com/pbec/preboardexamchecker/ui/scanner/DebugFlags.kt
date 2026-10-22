@@ -1,9 +1,7 @@
 package com.pbec.preboardexamchecker.ui.scanner
 
-import com.pbec.preboardexamchecker.BuildConfig
-
 object DebugFlags {
-    // Off in release: even async saving costs disk + memory.
+    // Opt in only during diagnostics; distributed debug APKs must not dump camera frames.
     @Volatile
-    var SAVE_SCAN_DEBUG: Boolean = BuildConfig.DEBUG
+    var SAVE_SCAN_DEBUG: Boolean = false
 }

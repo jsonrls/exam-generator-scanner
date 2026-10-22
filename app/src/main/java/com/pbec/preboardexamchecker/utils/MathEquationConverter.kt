@@ -517,10 +517,11 @@ object MathEquationConverter {
 
     private fun normalizeRootPhrases(source: String): String {
         var result = source
-        val parenthesizedRoot = Regex("""(?i)\b(?:sq\.?\s*rt\.?|square\s+root|sqrt)\s*(?:of\s*)?\(([^()]*)\)""")
+        val parenthesizedRoot = Regex("""(?i)(?<!\\)\b(?:sq\.?\s*rt\.?|square\s+root|sqrt)\s*(?:of\s*)?\(([^()]*)\)""")
         result = parenthesizedRoot.replace(result) { "\\sqrt{${it.groupValues[1]}}" }
 
-        val bracedRoot = Regex("""(?i)\b(?:sq\.?\s*rt\.?|square\s+root|sqrt)\s*(?:of\s*)?\{([^{}]*)}""")
+        // Android's ICU regex engine requires the literal closing brace to be escaped.
+        val bracedRoot = Regex("""(?i)(?<!\\)\b(?:sq\.?\s*rt\.?|square\s+root|sqrt)\s*(?:of\s*)?\{([^{}]*)\}""")
         result = bracedRoot.replace(result) { "\\sqrt{${it.groupValues[1]}}" }
 
         val simpleRoot = Regex("""(?i)\b(?:square\s+root|sqrt)\s+of\s+([A-Za-z0-9.πθφλ]+)""")

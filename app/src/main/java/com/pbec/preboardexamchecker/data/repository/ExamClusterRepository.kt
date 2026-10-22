@@ -34,10 +34,20 @@ class ExamClusterRepository @Inject constructor(
     }
 
     override suspend fun getClustersOnce(): List<ExamCluster> {
-        val uid = ensureUid()
+        return loadClusters(com.google.firebase.firestore.Source.DEFAULT)
+    }
+
+    override suspend fun getClustersForOfflinePreparation(): List<ExamCluster> =
+        loadClusters(com.google.firebase.firestore.Source.SERVER)
+
+    private suspend fun loadClusters(source: com.google.firebase.firestore.Source): List<ExamCluster> {
+        val uid = if (source == com.google.firebase.firestore.Source.SERVER)
+            FirebaseAuth.getInstance().currentUser?.takeUnless { it.isAnonymous }?.uid
+                ?: error("Sign in before preparing a session.")
+            else ensureUid()
         return firestore.collection("exam_clusters")
             .whereEqualTo("uploadedByUid", uid)
-            .get()
+            .get(source)
             .await()
             .documents
             .mapNotNull { it.toCluster() }

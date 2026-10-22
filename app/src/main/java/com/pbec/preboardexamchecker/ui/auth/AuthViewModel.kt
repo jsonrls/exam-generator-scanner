@@ -1,10 +1,16 @@
 package com.pbec.preboardexamchecker.ui.auth
 
 import android.content.Context
+import android.util.Log
+import com.google.firebase.FirebaseTooManyRequestsException
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.firestore.FirebaseFirestoreException
 import androidx.lifecycle.ViewModel
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -12,7 +18,6 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.security.MessageDigest
 import java.util.Calendar
 import javax.inject.Inject
 
@@ -36,18 +41,23 @@ class AuthViewModel @Inject constructor(
     }
 
     fun login(instructorId: String, password: String, onSuccess: () -> Unit) {
+        if (_isLoading.value) return
+        if (instructorId.contains("@")) {
+            loginWithEmail(instructorId.trim(), password, onSuccess)
+            return
+        }
         val normalizedInstructorId = instructorId.trim().uppercase()
         if (normalizedInstructorId.isBlank() || password.isBlank()) {
-            _errorMessage.value = "Teacher ID and password are required."
+            _errorMessage.value = "Teacher ID or email and password are required."
             return
         }
         if (!teacherIdRegex.matches(normalizedInstructorId)) {
-            _errorMessage.value = "Teacher ID format must be like T2026-001."
+            _errorMessage.value = "Enter a Teacher ID like T2026-001 or your email address."
             return
         }
 
         _isLoading.value = true
-        val hashedInputPassword = sha256(password.trim())
+        _errorMessage.value = null
 
         ensureFirebaseSession {
             firestore.collection("users")
@@ -56,10 +66,9 @@ class AuthViewModel @Inject constructor(
                 .get()
                 .addOnSuccessListener { teacherSnapshot ->
                     if (!teacherSnapshot.isEmpty) {
-                        validatePasswordAndStartSession(
+                        startTeacherSession(
                             teacherDocument = teacherSnapshot.documents.firstOrNull(),
-                            hashedInputPassword = hashedInputPassword,
-                            password = password.trim(),
+                            password = password,
                             onSuccess = onSuccess
                         )
                         return@addOnSuccessListener
@@ -77,23 +86,91 @@ class AuthViewModel @Inject constructor(
                                 return@instructorLookup
                             }
 
-                            validatePasswordAndStartSession(
+                            startTeacherSession(
                                 teacherDocument = instructorSnapshot.documents.firstOrNull(),
-                                hashedInputPassword = hashedInputPassword,
-                                password = password.trim(),
+                                password = password,
                                 onSuccess = onSuccess
                             )
                         }
                         .addOnFailureListener { error ->
                             _isLoading.value = false
-                            _errorMessage.value = "Cannot access teacher records: ${error.message}"
+                            _errorMessage.value = failureMessage("profile_lookup", error)
                         }
                 }
                 .addOnFailureListener { error ->
                     _isLoading.value = false
-                    _errorMessage.value = "Cannot access teacher records: ${error.message}"
+                    _errorMessage.value = failureMessage("profile_lookup", error)
                 }
         }
+    }
+
+    private fun loginWithEmail(email: String, password: String, onSuccess: () -> Unit) {
+        if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches() || password.isBlank()) {
+            _errorMessage.value = "Enter a valid email address and your password."
+            return
+        }
+        _isLoading.value = true
+        _errorMessage.value = null
+        auth.signInWithEmailAndPassword(email, password).addOnSuccessListener { result ->
+            val uid = result.user?.uid
+            if (uid == null) {
+                _isLoading.value = false
+                _errorMessage.value = "Sign-in failed. Please try again."
+                return@addOnSuccessListener
+            }
+            val signedInUser = result.user ?: return@addOnSuccessListener
+            if (auth.currentUser !== signedInUser) return@addOnSuccessListener
+            firestore.collection("users").document(uid).get()
+                .addOnSuccessListener { document -> finishTeacherSession(document, signedInUser, onSuccess) }
+                .addOnFailureListener {
+                    if (auth.currentUser !== signedInUser) return@addOnFailureListener
+                    auth.signOut()
+                    _isLoading.value = false
+                    _errorMessage.value = failureMessage("profile_lookup", it)
+                }
+        }.addOnFailureListener {
+            _isLoading.value = false
+            _errorMessage.value = failureMessage("password_sign_in", it)
+        }
+    }
+
+    private fun finishTeacherSession(document: DocumentSnapshot, user: FirebaseUser, onSuccess: () -> Unit) {
+        if (auth.currentUser !== user) return
+        val teacherId = document.getString("teacherId") ?: document.getString("instructorId")
+        val inactive = document.getBoolean("isActive") == false || document.getString("status").equals("inactive", true)
+        if (!document.exists() || user.isAnonymous || user.uid != document.id || teacherId.isNullOrBlank() || inactive) {
+            auth.signOut()
+            _isLoading.value = false
+            _errorMessage.value = if (inactive) "Account is inactive and pending admin activation." else "Teacher account identity does not match its profile. Contact an administrator."
+            return
+        }
+        val email = user.email.orEmpty()
+        if (email.isBlank()) {
+            auth.signOut()
+            _isLoading.value = false
+            _errorMessage.value = "Teacher account has no sign-in email. Contact an administrator."
+            return
+        }
+        val finish = finish@ {
+            if (auth.currentUser !== user) return@finish
+            persistTeacherSession(document, email)
+            val preferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            val key = "pending_email_${user.uid}"
+            if (preferences.getString(key, null).equals(email, true)) preferences.edit().remove(key).apply()
+            _isLoading.value = false
+            _errorMessage.value = null
+            onSuccess()
+        }
+        if (document.getString("email") != email) {
+            firestore.collection("users").document(user.uid).update("email", email)
+                .addOnSuccessListener { finish() }
+                .addOnFailureListener {
+                    if (auth.currentUser !== user) return@addOnFailureListener
+                    auth.signOut()
+                    _isLoading.value = false
+                    _errorMessage.value = "Your email is verified, but your profile could not sync. Sign in with your new email and try again. " + failureMessage("email_profile_sync", it)
+                }
+        } else finish()
     }
 
     fun register(
@@ -103,6 +180,7 @@ class AuthViewModel @Inject constructor(
         email: String,
         onSuccess: (String, String) -> Unit
     ) {
+        if (_isLoading.value) return
         if (fullName.isBlank() || school.isBlank() || position.isBlank() || email.isBlank()) {
             _errorMessage.value = "Full name, school, position, and email are required."
             return
@@ -113,8 +191,9 @@ class AuthViewModel @Inject constructor(
         }
 
         _isLoading.value = true
+        _errorMessage.value = null
 
-        ensureFirebaseSession {
+        ensureFirebaseSession(requireAnonymous = true) {
             firestore.collection("users")
                 .whereEqualTo("email", email.trim())
                 .limit(1)
@@ -128,13 +207,12 @@ class AuthViewModel @Inject constructor(
 
                     generateTeacherId { generatedTeacherId ->
                         val defaultPassword = deriveDefaultPasswordFromTeacherId(generatedTeacherId)
-                        val hashedPassword = sha256(defaultPassword)
                         val now = Timestamp.now()
                         val activationDeadline = Timestamp(java.util.Date(now.toDate().time + 7L * 24 * 60 * 60 * 1000))
                         val anonymousUser = auth.currentUser
-                        if (anonymousUser == null) {
+                        if (anonymousUser == null || !anonymousUser.isAnonymous) {
                             _isLoading.value = false
-                            _errorMessage.value = "Session missing. Please try again."
+                            _errorMessage.value = "Registration requires a guest session. Sign out and try again."
                             return@generateTeacherId
                         }
                         val credential = EmailAuthProvider.getCredential(email.trim(), defaultPassword)
@@ -156,7 +234,6 @@ class AuthViewModel @Inject constructor(
                                             "position" to position.trim(),
                                             "department" to position.trim(),
                                             "email" to email.trim(),
-                                            "passwordHash" to hashedPassword,
                                             "role" to "teacher",
                                             "isActive" to false,
                                             "status" to "inactive",
@@ -172,42 +249,34 @@ class AuthViewModel @Inject constructor(
                                     }
                                     .addOnFailureListener { error ->
                                         _isLoading.value = false
-                                        _errorMessage.value = "Cannot create teacher account: ${error.message}"
+                                        _errorMessage.value = "Sign-in account was created, but the teacher profile could not be saved. Contact an administrator before registering again. " + failureMessage("profile_creation", error)
                                     }
                             }
                             .addOnFailureListener { error ->
                                 _isLoading.value = false
-                                _errorMessage.value = firebaseAuthErrorMessage(error)
+                                _errorMessage.value = failureMessage("registration_link", error)
                             }
                     }
                 }
                 .addOnFailureListener { error ->
                     _isLoading.value = false
-                    _errorMessage.value = "Cannot access teacher records: ${error.message}"
+                    _errorMessage.value = failureMessage("profile_lookup", error)
                 }
         }
     }
 
-    private fun validatePasswordAndStartSession(
+    private fun startTeacherSession(
         teacherDocument: DocumentSnapshot?,
-        hashedInputPassword: String,
         password: String,
         onSuccess: () -> Unit
     ) {
-        val snapshotHash = teacherDocument?.getString("passwordHash")
-        if (snapshotHash.isNullOrBlank()) {
+        if (teacherDocument == null) {
             _isLoading.value = false
-            _errorMessage.value = "Teacher account has no password hash."
-            return
-        }
-
-        if (!snapshotHash.equals(hashedInputPassword, ignoreCase = true)) {
-            _isLoading.value = false
-            _errorMessage.value = "Invalid login credentials."
+            _errorMessage.value = "Teacher profile not found. Contact an administrator."
             return
         }
         val isActive = teacherDocument.getBoolean("isActive") ?: true
-        if (!isActive) {
+        if (!isActive || teacherDocument.getString("status")?.equals("inactive", ignoreCase = true) == true) {
             _isLoading.value = false
             val activationDeadline = teacherDocument.getTimestamp("activationDeadline")
             val deadlineMessage = activationDeadline?.toDate()?.let { " Activation deadline: $it." } ?: ""
@@ -223,28 +292,31 @@ class AuthViewModel @Inject constructor(
 
         auth.signInWithEmailAndPassword(email, password)
             .addOnSuccessListener { result ->
+                val signedInUser = result.user ?: return@addOnSuccessListener
+                if (auth.currentUser !== signedInUser) return@addOnSuccessListener
                 if (result.user?.uid != teacherDocument.id) {
                     auth.signOut()
                     _isLoading.value = false
                     _errorMessage.value = "Teacher account identity does not match its profile. Contact an administrator."
                     return@addOnSuccessListener
                 }
-                persistTeacherSession(teacherDocument)
-                _isLoading.value = false
-                _errorMessage.value = null
-                onSuccess()
+                finishTeacherSession(teacherDocument, signedInUser, onSuccess)
             }
             .addOnFailureListener { error ->
                 _isLoading.value = false
-                _errorMessage.value = "Firebase account sign-in failed: ${error.message}. Contact an administrator if your password was reset."
+                _errorMessage.value = failureMessage("password_sign_in", error)
             }
     }
 
-    private fun ensureFirebaseSession(onReady: () -> Unit) {
+    private fun ensureFirebaseSession(requireAnonymous: Boolean = false, onReady: () -> Unit) {
         val existingUser = auth.currentUser
         if (existingUser != null) {
-            onReady()
-            return
+            if (requireAnonymous && !existingUser.isAnonymous) {
+                auth.signOut()
+            } else {
+                onReady()
+                return
+            }
         }
 
         auth.signInAnonymously()
@@ -253,34 +325,43 @@ class AuthViewModel @Inject constructor(
             }
             .addOnFailureListener { error ->
                 _isLoading.value = false
-                _errorMessage.value = firebaseAuthErrorMessage(error)
+                _errorMessage.value = failureMessage("anonymous_session", error)
             }
     }
 
-    private fun firebaseAuthErrorMessage(error: Exception): String {
-        val message = error.message?.takeIf { it.isNotBlank() } ?: "Unknown error"
-        return if (message.contains("API key expired", ignoreCase = true)) {
-            "Firebase auth failed: API key expired. Replace app/google-services.json with the latest Firebase config and rebuild the app."
-        } else {
-            "Firebase auth failed: $message. Check that Anonymous auth is enabled in Firebase."
+    private fun failureMessage(stage: String, error: Exception): String {
+        val code = when (error) {
+            is FirebaseAuthException -> error.errorCode
+            is FirebaseFirestoreException -> error.code.name
+            is FirebaseNetworkException -> "NETWORK_ERROR"
+            is FirebaseTooManyRequestsException -> "ERROR_TOO_MANY_REQUESTS"
+            else -> "UNKNOWN_ERROR"
         }
+        Log.w("TeacherAuth", "stage=$stage code=$code")
+        val detail = when (code) {
+            "ERROR_INVALID_CREDENTIAL", "ERROR_INVALID_LOGIN_CREDENTIALS", "ERROR_WRONG_PASSWORD", "ERROR_USER_NOT_FOUND" ->
+                "Invalid email or password. Use your current Firebase account password."
+            "ERROR_OPERATION_NOT_ALLOWED" -> if (stage == "anonymous_session")
+                "Guest sign-in is unavailable. Ask an administrator to check Anonymous authentication."
+            else "Email/password sign-in is unavailable. Ask an administrator to check Email/Password authentication."
+            "ERROR_EMAIL_ALREADY_IN_USE", "ERROR_CREDENTIAL_ALREADY_IN_USE" -> "Email is already registered."
+            "ERROR_WEAK_PASSWORD" -> "The account password does not meet the configured password requirements. Contact an administrator."
+            "ERROR_PROVIDER_ALREADY_LINKED" -> "This session already has a sign-in account. Please restart registration."
+            "ERROR_INVALID_API_KEY", "ERROR_APP_NOT_AUTHORIZED", "ERROR_INVALID_APP_CREDENTIAL" -> "The app's Firebase configuration could not be verified. Contact an administrator."
+            "ERROR_INTERNAL_ERROR" -> "The sign-in service could not complete the request. Try again; contact an administrator if it continues."
+            "ERROR_USER_DISABLED" -> "This sign-in account is disabled. Contact an administrator."
+            "ERROR_TOO_MANY_REQUESTS" -> "Too many attempts. Please try again later."
+            "NETWORK_ERROR", "UNAVAILABLE" -> "Check your connection and try again."
+            else -> "Unable to complete this step. Contact an administrator if it continues."
+        }
+        return "$detail (code: $code)"
     }
 
-    private fun sha256(value: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
-        val hexBuilder = StringBuilder(bytes.size * 2)
-        bytes.forEach { byte ->
-            hexBuilder.append("%02x".format(byte))
-        }
-        return hexBuilder.toString()
-    }
-
-    private fun persistTeacherSession(teacherDocument: DocumentSnapshot) {
+    private fun persistTeacherSession(teacherDocument: DocumentSnapshot, teacherEmail: String) {
         val teacherId = teacherDocument.getString("teacherId")
             ?: teacherDocument.getString("instructorId")
             ?: ""
         val teacherName = teacherDocument.getString("name") ?: "Teacher"
-        val teacherEmail = teacherDocument.getString("email") ?: ""
         val teacherDepartment = teacherDocument.getString("department") ?: ""
         val teacherSchool = teacherDocument.getString("school") ?: ""
         val teacherPosition = teacherDocument.getString("position") ?: teacherDepartment
@@ -318,7 +399,7 @@ class AuthViewModel @Inject constructor(
             }
             .addOnFailureListener { error ->
                 _isLoading.value = false
-                _errorMessage.value = "Failed to generate Teacher ID: ${error.message}"
+                _errorMessage.value = failureMessage("teacher_id_generation", error)
             }
     }
 

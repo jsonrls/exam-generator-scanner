@@ -7,6 +7,7 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pbec.preboardexamchecker.data.models.Exam
+import com.pbec.preboardexamchecker.data.models.ExamData
 import com.pbec.preboardexamchecker.data.models.Question
 import com.pbec.preboardexamchecker.data.repository.ExamRepository
 import com.pbec.preboardexamchecker.data.repository.QuestionRepository
@@ -56,6 +57,10 @@ class ExamContentViewModel @Inject constructor(
             try {
                 val currentExam = examRepository.getExamById(examId)
                 _exam.value = currentExam
+                if (currentExam == null) {
+                    _message.value = "Exam not found or no longer available."
+                    return@launch
+                }
 
                 currentExam?.let { exam ->
                     // Show the questions for THIS set, in the set's stored (printed) order.
@@ -66,7 +71,7 @@ class ExamContentViewModel @Inject constructor(
                         return@launch
                     }
 
-                    allSubjectQuestions = questionRepository.getAllQuestionsForSubjectOnce(exam.subject)
+                    allSubjectQuestions = questionRepository.getQuestionsForExam(exam)
 
                     // FIX: Ensure the assigned value matches the StateFlow type
                     _questionsInSet.value = orderedQuestions(questionIdsToLoad)
@@ -78,9 +83,9 @@ class ExamContentViewModel @Inject constructor(
         }
     }
 
-    /** Builds the question list for [ids] in the given order, skipping any missing ids. */
+    /** A partial exam would change printed numbering and its answer key. */
     private fun orderedQuestions(ids: List<Long>): List<Question> =
-        ids.mapNotNull { id -> allSubjectQuestions.firstOrNull { it.id == id } }
+        ExamData.orderedQuestions(requireNotNull(_exam.value), ids, allSubjectQuestions)
 
     /**
      * Exports the chosen set ("A" or "B") to PDF in its own shuffled order.
@@ -99,7 +104,10 @@ class ExamContentViewModel @Inject constructor(
             else
                 currentExam.setAQuestionIds
 
-            val questions = orderedQuestions(ids)
+            val questions = try { orderedQuestions(ids) } catch (e: IllegalArgumentException) {
+                _message.value = e.message
+                return@launch
+            }
             if (questions.isEmpty()) {
                 _message.value = "Set $set has no questions to export."
                 return@launch

@@ -3,21 +3,14 @@ package com.pbec.preboardexamchecker.utils
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
 import android.net.Uri
 import android.util.Log
 import android.view.View
-import android.webkit.ConsoleMessage
-import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.core.graphics.createBitmap
-import androidx.core.net.toUri
-import com.pbec.preboardexamchecker.BuildConfig
 import com.itextpdf.io.font.constants.StandardFonts
 import com.itextpdf.io.font.PdfEncodings
 import com.itextpdf.io.image.ImageData
@@ -39,19 +32,19 @@ import com.itextpdf.layout.properties.TextAlignment
 import com.itextpdf.layout.properties.UnitValue
 import com.itextpdf.layout.properties.VerticalAlignment
 import com.pbec.preboardexamchecker.data.models.Question
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.text.Normalizer
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.math.min
 
 class PdfExportUtil(private val context: Context) {
 
@@ -62,10 +55,9 @@ class PdfExportUtil(private val context: Context) {
     private lateinit var normalDocumentFont: PdfFont
     private var textFallbackFonts: List<PdfFont> = emptyList()
     private var sharedWebView: WebView? = null
+    private var equationRenderHost: PdfEquationRenderHost? = null
     private val defaultFontSize = 10f
     private val textLineSpacing = defaultFontSize * 1.1f
-    private val equationLineSpacing = defaultFontSize * 1.25f
-    private val targetEquationHeight = textLineSpacing * 1.35f
     private val minCellWidth = 10f
     private val equationSpacing = defaultFontSize * 0.15f
     private val optionHorizontalPadding = 2f
@@ -108,9 +100,9 @@ class PdfExportUtil(private val context: Context) {
 
     private fun loadHtmlTemplate(context: Context): String {
         return try {
-            context.assets.open("katex/math_template.html").bufferedReader().use { it.readText() }
+            context.assets.open("katex/pdf_math_template.html").bufferedReader().use { it.readText() }
         } catch (e: IOException) {
-            Log.e("PdfExportUtil", "Failed to load math_template.html: ${e.message}")
+            Log.e("PdfExportUtil", "Failed to load pdf_math_template.html: ${e.message}")
             ""
         }
     }
@@ -184,179 +176,6 @@ class PdfExportUtil(private val context: Context) {
                 }
             }
         }
-    }
-
-    private suspend fun renderLaTeXToBitmap(
-        latexString: String,
-        originalText: String,
-        displayMode: Boolean = false,
-        availableWidth: Float = 400f
-    ): Bitmap {
-        return withContext(Dispatchers.Main) {
-            Log.d("PdfExportUtil", "Starting renderLaTeXToBitmap for: $latexString, displayMode=$displayMode")
-            val webView = sharedWebView ?: run {
-                Log.e("PdfExportUtil", "WebView not available for LaTeX: $latexString, using fallback")
-                return@withContext createFallbackBitmap(originalText, targetEquationHeight)
-            }
-
-            if (latexString.isBlank() || MathEquationConverter.isUnderscoreOnly(latexString)) {
-                Log.w("PdfExportUtil", "Empty or underscore-only LaTeX string, using fallback")
-                return@withContext createFallbackBitmap(originalText, targetEquationHeight)
-            }
-
-            try {
-                val bitmap = withTimeoutOrNull(5_000L) {
-                    suspendCancellableCoroutine<Bitmap> { continuation ->
-                        val onRenderError: (Exception) -> Unit = { exception ->
-                            if (continuation.isActive) {
-                                Log.e("PdfExportUtil", "Error rendering LaTeX '$latexString': ${exception.message}")
-                                continuation.resumeWithException(exception)
-                            }
-                        }
-
-                        var retryCount = 0
-                        val maxRetries = 2
-
-                        webView.webChromeClient = object : WebChromeClient() {
-                            override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
-                                if (BuildConfig.DEBUG) {
-                                    Log.d("WebViewConsole", "${consoleMessage.message()} -- From ${consoleMessage.sourceId()}:${consoleMessage.lineNumber()}")
-                                }
-                                when {
-                                    consoleMessage.message().startsWith("js-callback://renderComplete") -> {
-                                        val uri = consoleMessage.message().toUri()
-                                        val width = uri.getQueryParameter("width")?.toFloatOrNull() ?: 0f
-                                        var height = uri.getQueryParameter("height")?.toFloatOrNull() ?: 0f
-
-                                        if (width <= 0 || height <= 0) {
-                                            if (retryCount < maxRetries) {
-                                                retryCount++
-                                                Log.w("PdfExportUtil", "Invalid dimensions (W=$width, H=$height), retrying ($retryCount/$maxRetries)")
-                                                val escapedLatexString = latexString.replace("\\", "\\\\").replace("'", "\\'")
-                                                webView.evaluateJavascript("""
-                                                    try {
-                                                        console.log('JS: Retrying render "$escapedLatexString"');
-                                                        window.androidCallback.render('$escapedLatexString', $displayMode);
-                                                    } catch (e) {
-                                                        console.error('JS: Retry error: ' + e.message);
-                                                        window.location.href = 'js-callback://renderError?message=' + encodeURIComponent('JS_EVAL_ERROR: ' + e.message);
-                                                    }
-                                                """.trimIndent(), null)
-                                                return true
-                                            } else {
-                                                onRenderError(RuntimeException("Invalid dimensions: W=$width, H=$height for LaTeX: $latexString"))
-                                                return true
-                                            }
-                                        }
-
-                                        val aspectRatio = width / height
-                                        val finalHeight = (targetEquationHeight * 0.8f).coerceAtMost(16f)
-                                        val finalWidth = (finalHeight * aspectRatio).coerceAtMost(availableWidth * 0.8f)
-                                        val scaleFactor = min(finalWidth / width, finalHeight / height) * 0.9f // Reduced scale for better fit
-
-                                        val bitmapWidthPx = (width * scaleFactor).toInt().coerceAtLeast(10)
-                                        val bitmapHeightPx = (height * scaleFactor).toInt().coerceAtLeast(10)
-
-                                        // Extremely small rendered equations often appear as black blobs in PDF.
-                                        if (bitmapWidthPx < 18 || bitmapHeightPx < 12) {
-                                            Log.w(
-                                                "PdfExportUtil",
-                                                "Rendered equation too small (W=$bitmapWidthPx, H=$bitmapHeightPx), using text fallback for '$originalText'"
-                                            )
-                                            if (continuation.isActive) {
-                                                continuation.resume(createFallbackBitmap(originalText, targetEquationHeight))
-                                            }
-                                            return true
-                                        }
-
-                                        if (!displayMode && finalWidth > availableWidth * 0.8f) {
-                                            Log.w("PdfExportUtil", "Width $finalWidth exceeds available $availableWidth, retrying as display mode")
-                                            continuation.cancel()
-                                            CoroutineScope(Dispatchers.Main).launch {
-                                                val displayBitmap = renderLaTeXToBitmap(latexString, originalText, displayMode = true, availableWidth)
-                                                if (continuation.isActive) continuation.resume(displayBitmap)
-                                            }
-                                            return true
-                                        }
-
-                                        webView.evaluateJavascript("""
-                                            document.getElementById('latexOutput').style.transform = 'scale(${scaleFactor})';
-                                            document.getElementById('latexOutput').style.transformOrigin = '0 0';
-                                        """.trimIndent(), null)
-
-                                        webView.measure(
-                                            View.MeasureSpec.makeMeasureSpec(bitmapWidthPx, View.MeasureSpec.EXACTLY),
-                                            View.MeasureSpec.makeMeasureSpec(bitmapHeightPx, View.MeasureSpec.EXACTLY)
-                                        )
-                                        webView.layout(0, 0, bitmapWidthPx, bitmapHeightPx)
-
-                                        val bitmap = createBitmap(bitmapWidthPx, bitmapHeightPx, Bitmap.Config.ARGB_8888)
-                                        val canvas = Canvas(bitmap)
-                                        canvas.drawColor(Color.WHITE)
-                                        webView.draw(canvas)
-
-                                        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, bitmapWidthPx, bitmapHeightPx, true)
-                                        bitmap.recycle()
-                                        Log.d("PdfExportUtil", "Rendered bitmap: W=$bitmapWidthPx, H=$bitmapHeightPx")
-                                        if (continuation.isActive) continuation.resume(scaledBitmap)
-                                        return true
-                                    }
-                                    consoleMessage.message().startsWith("js-callback://renderError") -> {
-                                        val uri = consoleMessage.message().toUri()
-                                        val errorMessage = uri.getQueryParameter("message") ?: "Unknown KaTeX error"
-                                        onRenderError(RuntimeException("KaTeX failed: $errorMessage for LaTeX: $latexString"))
-                                        return true
-                                    }
-                                    else -> return super.onConsoleMessage(consoleMessage)
-                                }
-                            }
-                        }
-
-                        Log.d("PdfExportUtil", "Executing render for LaTeX: $latexString")
-                        val escapedLatexString = latexString.replace("\\", "\\\\").replace("'", "\\'")
-                        webView.evaluateJavascript("""
-                            try {
-                                console.log('JS: Rendering "$escapedLatexString"');
-                                window.androidCallback.render('$escapedLatexString', $displayMode);
-                            } catch (e) {
-                                console.error('JS: Error: ' + e.message);
-                                window.location.href = 'js-callback://renderError?message=' + encodeURIComponent('JS_EVAL_ERROR: ' + e.message);
-                            }
-                        """.trimIndent(), null)
-
-                        continuation.invokeOnCancellation {
-                            CoroutineScope(Dispatchers.Main).launch {
-                                webView.stopLoading()
-                                webView.loadUrl("about:blank")
-                                Log.d("PdfExportUtil", "Cancelled rendering for LaTeX: $latexString")
-                            }
-                        }
-                    }
-                } ?: createFallbackBitmap(originalText, targetEquationHeight).also {
-                    Log.e("PdfExportUtil", "Rendering timed out for LaTeX: $latexString, using fallback")
-                }
-                bitmap
-            } catch (e: Exception) {
-                Log.e("PdfExportUtil", "Error rendering LaTeX: $latexString, using fallback: ${e.message}")
-                createFallbackBitmap(originalText, targetEquationHeight)
-            }
-        }
-    }
-
-    private fun createFallbackBitmap(text: String, targetHeight: Float): Bitmap {
-        val safeText = sanitizePdfText(text)
-        val paint = Paint().apply {
-            color = Color.BLACK
-            textSize = defaultFontSize * 0.8f
-            isAntiAlias = true
-        }
-        val textWidth = paint.measureText(safeText.take(20))
-        val bitmap = createBitmap(textWidth.toInt() + 10, targetHeight.toInt(), Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        canvas.drawColor(Color.WHITE)
-        canvas.drawText(safeText.take(20), 5f, targetHeight * 0.8f, paint)
-        Log.d("PdfExportUtil", "Created fallback bitmap for text: $safeText")
-        return bitmap
     }
 
     private fun estimateTextWidth(text: String, font: PdfFont, fontSize: Float): Float {
@@ -470,10 +289,36 @@ class PdfExportUtil(private val context: Context) {
 
     private data class OptionPart(
         val text: String? = null,
-        val bitmap: Bitmap? = null,
         val imageData: ImageData? = null,
+        val equationSize: PdfEquationSize? = null,
         val estimatedWidth: Float = 0f
     )
+
+    private suspend fun renderEquationPart(latex: String): OptionPart {
+        val rendered = renderPdfEquation(
+            checkNotNull(sharedWebView) { "PDF equation WebView is unavailable" },
+            latex,
+            defaultFontSize
+        )
+        return try {
+            OptionPart(
+                imageData = ImageDataFactory.create(rendered.bitmap.toByteArray()),
+                equationSize = rendered.size,
+                estimatedWidth = rendered.size.width + 2f * equationSpacing
+            )
+        } finally {
+            rendered.bitmap.recycle()
+        }
+    }
+
+    private fun equationImage(part: OptionPart, availableWidth: Float): Image {
+        val size = checkNotNull(part.equationSize).fitToWidth(availableWidth - 2f * equationSpacing)
+        return Image(checkNotNull(part.imageData))
+            .setWidth(size.width)
+            .setHeight(size.height)
+            .setMarginLeft(equationSpacing)
+            .setMarginRight(equationSpacing)
+    }
 
     suspend fun exportExamToPdf(outputUri: Uri, examTitle: String, subjectCluster: String, questions: List<Question>) {
         Log.d("PdfExportUtil", "Starting exportExamToPdf: $examTitle, ${questions.size} questions")
@@ -484,10 +329,13 @@ class PdfExportUtil(private val context: Context) {
 
         try {
             withContext(Dispatchers.Main) {
-                sharedWebView = createWebView(context)?.also { wv ->
-                    setupWebView(wv)
-                    wv.awaitPageLoad()
-                }
+                val webView = createWebView(context) ?: error("Failed to initialize WebView")
+                sharedWebView = webView
+                setupWebView(webView)
+                val host = PdfEquationRenderHost(context, webView)
+                equationRenderHost = host
+                host.awaitReady()
+                webView.awaitPageLoad()
             }
             if (sharedWebView == null) throw IllegalStateException("Failed to initialize WebView")
 
@@ -622,25 +470,24 @@ class PdfExportUtil(private val context: Context) {
                                     }
                                     val convertedPart = MathEquationConverter.convertEquationTextToLaTeX(part)
                                     if (MathEquationConverter.containsMathSyntax(part) || MathEquationConverter.isChemicalFormula(part)) {
-                                        val bitmap = renderLaTeXToBitmap(convertedPart, part, displayMode = false, availableWidth = pageEffectiveWidth * 0.95f)
-                                        val imageData = ImageDataFactory.create(bitmap.toByteArray())
-                                        val image = Image(imageData)
-                                        image.scaleToFit(bitmap.width.toFloat() * 0.9f, targetEquationHeight)
-                                        image.setMarginLeft(equationSpacing)
-                                        image.setMarginRight(equationSpacing)
-                                        questionTextParagraph.add(image)
-                                        bitmap.recycle()
+                                        val equation = renderEquationPart(convertedPart)
+                                        questionTextParagraph.add(equationImage(equation, pageEffectiveWidth * 0.95f - 4f))
                                         hasEquationInParagraph = true
                                     } else {
                                         appendPdfText(questionTextParagraph, part, normalDocumentFont)
                                     }
                                 } catch (e: Exception) {
+                                    if (e is CancellationException) throw e
                                     Log.e("PdfExportUtil", "Error rendering LaTeX '$part': ${e.message}")
                                     appendPdfText(questionTextParagraph, part, normalDocumentFont)
                                 }
                             }
                         }
-                        questionTextParagraph.setFixedLeading(if (hasEquationInParagraph) equationLineSpacing else textLineSpacing)
+                        if (hasEquationInParagraph) {
+                            questionTextParagraph.setMultipliedLeading(1.1f)
+                        } else {
+                            questionTextParagraph.setFixedLeading(textLineSpacing)
+                        }
                     }
                     questionContentCell.add(questionTextParagraph)
 
@@ -648,176 +495,77 @@ class PdfExportUtil(private val context: Context) {
                         .map { sanitizePdfText(it) }
                         .filter { it.isNotBlank() }
                     val prefixes = listOf("A. ", "B. ", "C. ", "D. ").take(options.size)
-                    val renderedOptionParts = mutableListOf<Pair<MutableList<OptionPart>, String>>()
-                    val optionPrefixWidth = estimateTextWidth(prefixes[0], normalDocumentFont, defaultFontSize)
+                    val renderedOptionParts = mutableListOf<List<OptionPart>>()
                     val estimatedOptionWidths = mutableListOf<Float>()
 
-                    for (j in options.indices) {
-                        val optionText = options[j]
+                    for (optionText in options) {
                         val optionIsCurrency = MathEquationConverter.isCurrencyValue(optionText)
-                        val optionHasMath = MathEquationConverter.containsMathSyntax(optionText) || MathEquationConverter.isChemicalFormula(optionText)
-                        val convertedOptionText = if (optionIsCurrency || !optionHasMath) optionText else {
-                            try {
-                                MathEquationConverter.convertEquationTextToLaTeX(optionText)
-                            } catch (e: Exception) {
-                                Log.e("PdfExportUtil", "Error converting option text: $optionText, error: ${e.message}")
-                                optionText
-                            }
+                        val optionHasMath = MathEquationConverter.containsMathSyntax(optionText) ||
+                            MathEquationConverter.isChemicalFormula(optionText)
+                        val parts = if (optionIsCurrency || !optionHasMath) {
+                            listOf(optionText to false)
+                        } else {
+                            MathEquationConverter.splitMathParts(optionText)
                         }
-
-                        val currentOptionParts = mutableListOf<OptionPart>()
-                        var estimatedOptionWidth = optionPrefixWidth
-                        val optionTextParts = if (optionIsCurrency || !optionHasMath) listOf(Pair(optionText, false)) else MathEquationConverter.splitMathParts(optionText)
-
-                        for ((part, isMath) in optionTextParts) {
-                            if (!isMath || MathEquationConverter.getExcludedFractionUnits().contains(part.lowercase().replace(Regex("[^a-z0-9/]"), ""))) {
-                                if (part.isNotEmpty()) {
-                                    currentOptionParts.add(OptionPart(text = part, estimatedWidth = estimateTextWidth(part, normalDocumentFont, defaultFontSize)))
-                                    estimatedOptionWidth += estimateTextWidth(part, normalDocumentFont, defaultFontSize)
-                                }
+                        val renderedParts = mutableListOf<OptionPart>()
+                        for ((part, isMath) in parts) {
+                            val excludedUnit = MathEquationConverter.getExcludedFractionUnits()
+                                .contains(part.lowercase().replace(Regex("[^a-z0-9/]"), ""))
+                            val simpleMath = if (isMath) convertSimpleMathToText(part) else null
+                            if (!isMath || excludedUnit || simpleMath != null || isSimpleScriptMarkup(part)) {
+                                val text = simpleMath ?: part
+                                renderedParts.add(OptionPart(text = text, estimatedWidth = estimateTextWidth(text, normalDocumentFont, defaultFontSize)))
                             } else {
-                                // Do not render option math as bitmaps. Tiny raster outputs become black artifacts.
-                                val textFallback = convertSimpleMathToText(part) ?: sanitizePdfText(part)
-                                currentOptionParts.add(
-                                    OptionPart(
-                                        text = textFallback,
-                                        estimatedWidth = estimateTextWidth(textFallback, normalDocumentFont, defaultFontSize)
-                                    )
-                                )
-                                estimatedOptionWidth += estimateTextWidth(textFallback, normalDocumentFont, defaultFontSize)
+                                try {
+                                    renderedParts.add(renderEquationPart(MathEquationConverter.convertEquationTextToLaTeX(part)))
+                                } catch (error: Exception) {
+                                    if (error is CancellationException) throw error
+                                    Log.w("PdfExportUtil", "Option equation rendering failed; preserving source text", error)
+                                    renderedParts.add(OptionPart(text = part, estimatedWidth = estimateTextWidth(part, normalDocumentFont, defaultFontSize)))
+                                }
                             }
                         }
-                        renderedOptionParts.add(Pair(currentOptionParts, convertedOptionText))
-                        estimatedOptionWidths.add(estimatedOptionWidth.coerceAtLeast(minCellWidth))
+                        renderedOptionParts.add(renderedParts)
+                        val prefixWidth = estimateTextWidth(prefixes[renderedOptionParts.lastIndex], normalDocumentFont, defaultFontSize)
+                        estimatedOptionWidths.add(prefixWidth + renderedParts.sumOf { it.estimatedWidth.toDouble() }.toFloat())
                     }
 
-                    val contentCellWidth = pageEffectiveWidth * 0.95f
-                    val maxFourColumnOptionDisplayWidth = (contentCellWidth / 4f) - (2f * optionHorizontalPadding)
-                    val maxTwoColumnOptionDisplayWidth = (contentCellWidth / 2f) - (2f * optionHorizontalPadding)
-                    val maxOneColumnOptionDisplayWidth = contentCellWidth - (2f * optionHorizontalPadding)
-
-                    var useFourColumns = true
-                    var useTwoColumns = true
-                    for (width in estimatedOptionWidths) {
-                        if (width > maxFourColumnOptionDisplayWidth) useFourColumns = false
-                        if (width > maxTwoColumnOptionDisplayWidth) useTwoColumns = false
-                    }
-
-                    val optionsTable: Table
-                    val columnWidths: FloatArray
-
-                    when {
-                        useFourColumns -> {
-                            columnWidths = floatArrayOf(25f, 25f, 25f, 25f)
-                            optionsTable = Table(UnitValue.createPercentArray(columnWidths)).useAllAvailableWidth()
-                            optionsTable.setKeepTogether(true)
-                            for (j in options.indices) {
-                                val (parts, convertedText) = renderedOptionParts[j]
-                                val optionParagraph = Paragraph()
-                                    .setMargin(0f)
-                                    .setFontSize(defaultFontSize)
-                                    .setFixedLeading(if (MathEquationConverter.containsMathSyntax(convertedText) || MathEquationConverter.isChemicalFormula(convertedText)) equationLineSpacing else textLineSpacing)
-                                optionParagraph.add(Text(prefixes[j]).setFont(normalDocumentFont))
-                                for (part in parts) {
-                                    if (part.text != null) {
-                                        appendPdfText(optionParagraph, part.text, normalDocumentFont)
-                                    } else if (part.bitmap != null) {
-                                        val image = Image(part.imageData)
-                                        image.scaleToFit(maxFourColumnOptionDisplayWidth, targetEquationHeight)
-                                        image.setAutoScaleWidth(true)
-                                        image.setMarginLeft(equationSpacing)
-                                        image.setMarginRight(equationSpacing)
-                                        optionParagraph.add(image)
-                                        part.bitmap.recycle()
-                                    }
-                                }
-                                optionsTable.addCell(
-                                    Cell().add(optionParagraph)
-                                        .setPaddingLeft(optionHorizontalPadding)
-                                        .setPaddingRight(optionHorizontalPadding)
-                                        .setPaddingTop(optionVerticalPadding)
-                                        .setPaddingBottom(optionVerticalPadding)
-                                        .setBorder(null)
-                                        .setVerticalAlignment(VerticalAlignment.TOP)
-                                        .setMinWidth(minCellWidth)
-                                )
+                    // Account for the question cell's default left/right padding.
+                    val contentCellWidth = pageEffectiveWidth * 0.95f - 4f
+                    val columns = PdfEquationLayout.optionColumns(estimatedOptionWidths, contentCellWidth, optionHorizontalPadding)
+                    val optionWidth = contentCellWidth / columns - 2f * optionHorizontalPadding
+                    val optionsTable = Table(UnitValue.createPercentArray(FloatArray(columns) { 1f }))
+                        .useAllAvailableWidth()
+                        .setKeepTogether(true)
+                    for (j in options.indices) {
+                        val parts = renderedOptionParts[j]
+                        val optionParagraph = Paragraph()
+                            .setMargin(0f)
+                            .setFontSize(defaultFontSize)
+                        if (parts.any { it.imageData != null }) {
+                            optionParagraph.setMultipliedLeading(1.1f)
+                        } else {
+                            optionParagraph.setFixedLeading(textLineSpacing)
+                        }
+                        optionParagraph.add(Text(prefixes[j]).setFont(normalDocumentFont))
+                        val prefixWidth = estimateTextWidth(prefixes[j], normalDocumentFont, defaultFontSize)
+                        for (part in parts) {
+                            if (part.text != null) {
+                                appendPdfText(optionParagraph, part.text, normalDocumentFont)
+                            } else {
+                                optionParagraph.add(equationImage(part, optionWidth - prefixWidth))
                             }
                         }
-                        useTwoColumns -> {
-                            columnWidths = floatArrayOf(50f, 50f)
-                            optionsTable = Table(UnitValue.createPercentArray(columnWidths)).useAllAvailableWidth()
-                            optionsTable.setKeepTogether(true)
-                            for (j in 0 until options.size step 2) {
-                                for (k in 0..1) {
-                                    if (j + k >= options.size) break
-                                    val (parts, convertedText) = renderedOptionParts[j + k]
-                                    val optionParagraph = Paragraph()
-                                        .setMargin(0f)
-                                        .setFontSize(defaultFontSize)
-                                        .setFixedLeading(if (MathEquationConverter.containsMathSyntax(convertedText) || MathEquationConverter.isChemicalFormula(convertedText)) equationLineSpacing else textLineSpacing)
-                                    optionParagraph.add(Text(prefixes[j + k]).setFont(normalDocumentFont))
-                                    for (part in parts) {
-                                        if (part.text != null) {
-                                            appendPdfText(optionParagraph, part.text, normalDocumentFont)
-                                        } else if (part.bitmap != null) {
-                                            val image = Image(part.imageData)
-                                            image.scaleToFit(maxTwoColumnOptionDisplayWidth, targetEquationHeight)
-                                            image.setAutoScaleWidth(true)
-                                            image.setMarginLeft(equationSpacing)
-                                            image.setMarginRight(equationSpacing)
-                                            optionParagraph.add(image)
-                                            part.bitmap.recycle()
-                                        }
-                                    }
-                                    optionsTable.addCell(
-                                        Cell().add(optionParagraph)
-                                            .setPaddingLeft(optionHorizontalPadding)
-                                            .setPaddingRight(optionHorizontalPadding)
-                                            .setPaddingTop(optionVerticalPadding)
-                                            .setPaddingBottom(optionVerticalPadding)
-                                            .setBorder(null)
-                                            .setVerticalAlignment(VerticalAlignment.TOP)
-                                            .setMinWidth(minCellWidth)
-                                    )
-                                }
-                            }
-                        }
-                        else -> {
-                            columnWidths = floatArrayOf(100f)
-                            optionsTable = Table(UnitValue.createPercentArray(columnWidths)).useAllAvailableWidth()
-                            optionsTable.setKeepTogether(true)
-                            for (j in options.indices) {
-                                val (parts, convertedText) = renderedOptionParts[j]
-                                val optionParagraph = Paragraph()
-                                    .setMargin(0f)
-                                    .setFontSize(defaultFontSize)
-                                    .setFixedLeading(if (MathEquationConverter.containsMathSyntax(convertedText) || MathEquationConverter.isChemicalFormula(convertedText)) equationLineSpacing else textLineSpacing)
-                                optionParagraph.add(Text(prefixes[j]).setFont(normalDocumentFont))
-                                for (part in parts) {
-                                    if (part.text != null) {
-                                        appendPdfText(optionParagraph, part.text, normalDocumentFont)
-                                    } else if (part.bitmap != null) {
-                                        val image = Image(part.imageData)
-                                        image.scaleToFit(maxOneColumnOptionDisplayWidth, targetEquationHeight)
-                                        image.setAutoScaleWidth(true)
-                                        image.setMarginLeft(equationSpacing)
-                                        image.setMarginRight(equationSpacing)
-                                        optionParagraph.add(image)
-                                        part.bitmap.recycle()
-                                    }
-                                }
-                                optionsTable.addCell(
-                                    Cell().add(optionParagraph)
-                                        .setPaddingLeft(optionHorizontalPadding)
-                                        .setPaddingRight(optionHorizontalPadding)
-                                        .setPaddingTop(optionVerticalPadding)
-                                        .setPaddingBottom(optionVerticalPadding)
-                                        .setBorder(null)
-                                        .setVerticalAlignment(VerticalAlignment.TOP)
-                                        .setMinWidth(minCellWidth)
-                                )
-                            }
-                        }
+                        optionsTable.addCell(
+                            Cell().add(optionParagraph)
+                                .setPaddingLeft(optionHorizontalPadding)
+                                .setPaddingRight(optionHorizontalPadding)
+                                .setPaddingTop(optionVerticalPadding)
+                                .setPaddingBottom(optionVerticalPadding)
+                                .setBorder(null)
+                                .setVerticalAlignment(VerticalAlignment.TOP)
+                                .setMinWidth(minCellWidth)
+                        )
                     }
 
                     questionContentCell.add(optionsTable)
@@ -855,11 +603,16 @@ class PdfExportUtil(private val context: Context) {
             Log.e("PdfExportUtil", "Fatal error in exportExamToPdf: ${e.message}")
             throw e
         } finally {
-            withContext(Dispatchers.Main) {
-                sharedWebView?.stopLoading()
-                sharedWebView?.destroy()
-                sharedWebView = null
-                Log.d("PdfExportUtil", "Shared WebView destroyed")
+            withContext(NonCancellable + Dispatchers.Main) {
+                try {
+                    equationRenderHost?.close()
+                } finally {
+                    equationRenderHost = null
+                    sharedWebView?.stopLoading()
+                    sharedWebView?.destroy()
+                    sharedWebView = null
+                    Log.d("PdfExportUtil", "Shared WebView destroyed")
+                }
             }
         }
     }

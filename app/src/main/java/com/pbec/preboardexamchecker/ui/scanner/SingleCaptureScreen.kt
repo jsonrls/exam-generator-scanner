@@ -73,7 +73,7 @@ fun SingleCaptureScreen(
     val markersState by markersFlow.collectAsState()
     val lockedFlow = remember { MutableStateFlow(false) }
     val locked by lockedFlow.collectAsState()
-    val hasFired = remember { mutableStateOf(false) }
+    val captureGate = remember { CaptureGate() }
     var capturing by remember { mutableStateOf(false) }
     val resetSignal = remember { AtomicBoolean(false) }
 
@@ -87,13 +87,12 @@ fun SingleCaptureScreen(
 
     LaunchedEffect(viewModel) {
         viewModel.manualCaptureEvent.collect {
-            if (!hasFired.value) {
-                val capture = imageCaptureUseCase ?: return@collect
-                hasFired.value = true
+            val capture = imageCaptureUseCase ?: return@collect
+            if (captureGate.tryAcquire()) {
                 capturing = true
                 triggerCapture(capture, context, 0, scope, onCapture,
                     onCaptureError = {
-                        hasFired.value = false
+                        captureGate.reset()
                         capturing = false
                         resetSignal.set(true)
                         markersFlow.value = List(SIX) { null }
@@ -104,7 +103,7 @@ fun SingleCaptureScreen(
     }
     LaunchedEffect(viewModel) {
         viewModel.rearmCapture.collect {
-            hasFired.value = false
+            captureGate.reset()
             capturing = false
             resetSignal.set(true)
             markersFlow.value = List(SIX) { null }
@@ -129,7 +128,7 @@ fun SingleCaptureScreen(
                     }
                     val afIsReady = AtomicBoolean(false)
                     val imageCaptureBuilder = ImageCapture.Builder()
-                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     Camera2Interop.Extender(imageCaptureBuilder)
                         .setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
                             override fun onCaptureCompleted(
@@ -157,7 +156,7 @@ fun SingleCaptureScreen(
                         .build()
 
                     imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
-                        if (hasFired.value) { imageProxy.close(); return@setAnalyzer }
+                        if (captureGate.isBusy) { imageProxy.close(); return@setAnalyzer }
                         if (resetSignal.getAndSet(false)) {
                             for (i in 0 until SIX) { smoothed[i] = null; prevSmoothed[i] = null; windows[i].clear() }
                         }
@@ -169,7 +168,7 @@ fun SingleCaptureScreen(
                             Imgproc.cvtColor(srcMat, gray, Imgproc.COLOR_BGR2GRAY)
                             srcMat.release()
 
-                            val laplacianVariance = sharpnessChecker.variance(bitmap)
+                            val laplacianVariance = sharpnessChecker.varianceMat(gray)
                             val sharp = laplacianVariance >= 50.0
                             bitmap.recycle()
 
@@ -235,8 +234,8 @@ fun SingleCaptureScreen(
                             markersFlow.value = overlay.toList()
                             lockedFlow.value = found6
 
-                            if (allStable && !hasFired.value && afIsReady.get()) {
-                                hasFired.value = true
+                            if (allStable && afIsReady.get() &&
+                                !viewModel.blurRetryExhausted.value && captureGate.tryAcquire()) {
                                 val fracHints = Array(SIX) { i ->
                                     smoothed[i]?.let { pt -> Point(pt.x / analysisW, pt.y / analysisH) }
                                 }
@@ -245,7 +244,7 @@ fun SingleCaptureScreen(
                                     viewModel.setLockedMarkerHints(fracHints)
                                     triggerCapture(imageCapture, ctx, 0, scope, onCapture,
                                         onCaptureError = {
-                                            hasFired.value = false
+                                            captureGate.reset()
                                             capturing = false
                                             resetSignal.set(true)
                                             markersFlow.value = List(SIX) { null }
@@ -261,7 +260,7 @@ fun SingleCaptureScreen(
                                     SINGLE_STABILITY_WINDOW_MIN_HITS).coerceIn(0f, 1f)
                             else 0f
                             scope.launch(Dispatchers.Main) {
-                                if (!hasFired.value) viewModel.setCaptureProgress(progress)
+                                if (!captureGate.isBusy) viewModel.setCaptureProgress(progress)
                             }
                         } catch (e: Exception) {
                             Log.e("SingleCaptureScreen", "Analysis error", e)

@@ -137,7 +137,7 @@ class SingleCaptureProcessor(
 
         // ── Info zone ─────────────────────────────────────────────────────────
         val infoResult = infoProcessor.readWarpedZone(
-            cellEnhanced, cellEnhancedNeutral, infoMarkers, context.studentMap, debugContext
+            cellEnhanced, cellEnhancedNeutral, infoMarkers, context.students, debugContext
         )
         val scannedInfo = when (infoResult) {
             is InfoZoneProcessor.Result.Success -> infoResult.info

@@ -43,6 +43,7 @@ fun TrashScreen(
     val banks by viewModel.trashedBanks.collectAsState()
     val rosters by viewModel.trashedRosters.collectAsState()
     val trashedStudents by viewModel.trashedStudentsIndividual.collectAsState()
+    val errorMessage by viewModel.message.collectAsState()
     val scope = rememberCoroutineScope()
     val initialPage = when (initialTab?.lowercase()) {
         "exams" -> 1; "banks" -> 2; "rosters" -> 3; else -> 0
@@ -65,6 +66,10 @@ fun TrashScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
+            errorMessage?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(16.dp))
+            }
             // Scrollable so four tabs size to their content instead of wrapping ("Rosters").
             ScrollableTabRow(selectedTabIndex = pagerState.currentPage, edgePadding = 8.dp) {
                 TrashTab.entries.forEachIndexed { i, t ->

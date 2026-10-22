@@ -21,10 +21,20 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.pbec.preboardexamchecker.ui.theme.BrandTopAppBar
 import kotlinx.coroutines.flow.collectLatest
 
@@ -35,11 +45,22 @@ fun SecurityScreen(
     viewModel: SecurityViewModel = hiltViewModel()
 ) {
     var showChangePasswordSheet by remember { mutableStateOf(false) }
+    var showChangeEmailSheet by remember { mutableStateOf(false) }
+    val emailState by viewModel.emailState.collectAsState()
     var showLoginActivitySheet by remember { mutableStateOf(false) }
     
     val sheetState = rememberModalBottomSheetState()
     val snackbarHostState = remember { SnackbarHostState() }
     val isUpdatingPassword by viewModel.isUpdatingPassword.collectAsState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshPendingEmailStatus()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     LaunchedEffect(Unit) {
         viewModel.uiEvent.collectLatest { event ->
@@ -74,7 +95,7 @@ fun SecurityScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
-            SectionHeader("Password")
+            SectionHeader("Account security")
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -87,6 +108,17 @@ fun SecurityScreen(
                         title = "Change Password",
                         subtitle = "Update your account password",
                         onClick = { showChangePasswordSheet = true }
+                    )
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
+                    SecurityMenuItem(
+                        icon = Icons.Default.Email,
+                        title = "Change Email Address",
+                        subtitle = emailState.pendingEmail?.let { "Verification pending for $it" }
+                            ?: "Update your registered email address.",
+                        onClick = {
+                            showChangeEmailSheet = true
+                            viewModel.refreshPendingEmailStatus()
+                        }
                     )
                     HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                     SecurityMenuItem(
@@ -145,6 +177,19 @@ fun SecurityScreen(
             }
         }
 
+        if (showChangeEmailSheet) {
+            ModalBottomSheet(
+                onDismissRequest = { if (!emailState.busy) showChangeEmailSheet = false },
+                sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+            ) {
+                ChangeEmailSheetContent(emailState,
+                    onSubmit = viewModel::requestEmailChange,
+                    onFieldEdit = viewModel::clearEmailFieldError,
+                    onCheck = viewModel::checkEmailStatus,
+                    onDismiss = { showChangeEmailSheet = false })
+            }
+        }
+
         if (showLoginActivitySheet) {
             ModalBottomSheet(
                 onDismissRequest = { showLoginActivitySheet = false },
@@ -154,6 +199,82 @@ fun SecurityScreen(
                 LoginActivitySheetContent()
             }
         }
+    }
+}
+
+@Composable
+private fun ChangeEmailSheetContent(
+    state: EmailChangeState,
+    onSubmit: (String, String, () -> Unit) -> Unit,
+    onFieldEdit: (EmailField) -> Unit,
+    onCheck: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var editRequest by remember { mutableStateOf(false) }
+    val pending = state.pendingEmail
+    val emailFocus = remember { FocusRequester() }
+    val passwordFocus = remember { FocusRequester() }
+    LaunchedEffect(state.validationAttempt) {
+        if (!state.needsProfileSync && (pending == null || editRequest)) {
+            when (state.invalidField) {
+                EmailField.EMAIL -> emailFocus.requestFocus()
+                EmailField.PASSWORD -> passwordFocus.requestFocus()
+                null -> Unit
+            }
+        }
+    }
+    Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState())
+        .padding(24.dp).navigationBarsPadding(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text("Change Email Address", style = MaterialTheme.typography.headlineSmall)
+        Text("Current email", style = MaterialTheme.typography.labelLarge)
+        Text(state.currentEmail.ifBlank { "Sign in again to view your email." })
+        if (state.needsProfileSync) {
+            Text("Finish updating your account", style = MaterialTheme.typography.titleLarge)
+            Text("Check verification status to sync your account before requesting another email change.")
+        } else if (pending != null && !editRequest) {
+            if (pending.equals(state.currentEmail, ignoreCase = true)) {
+                Text("Email verified", style = MaterialTheme.typography.titleLarge)
+                Text("Your sign-in email has changed. Check verification status to finish syncing your account profile.")
+            } else {
+                Text("Check your new email", style = MaterialTheme.typography.titleLarge)
+                Text("We sent a verification link to $pending. Open it to confirm your new address, then return here.")
+                Text("Your email has not changed yet.")
+            }
+        } else {
+            Text("We’ll send a verification link to your new email address. Your current email stays active until you verify the new one.")
+            OutlinedTextField(value = email, onValueChange = { email = it; onFieldEdit(EmailField.EMAIL) },
+                label = { Text("New email address") }, singleLine = true, enabled = !state.busy,
+                isError = state.emailError != null,
+                supportingText = { state.emailError?.let { Text(it) } },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), modifier = Modifier.fillMaxWidth().focusRequester(emailFocus))
+            OutlinedTextField(value = password, onValueChange = { password = it; onFieldEdit(EmailField.PASSWORD) },
+                label = { Text("Current password") }, singleLine = true, enabled = !state.busy,
+                isError = state.passwordError != null,
+                supportingText = { state.passwordError?.let { Text(it) } },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = { IconButton(onClick = { passwordVisible = !passwordVisible }, enabled = !state.busy) {
+                    Icon(if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (passwordVisible) "Hide password" else "Show password")
+                } }, modifier = Modifier.fillMaxWidth().focusRequester(passwordFocus))
+            Button(onClick = { onSubmit(email, password) { password = ""; editRequest = false } },
+                enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                Text(if (state.action == EmailAction.SEND_LINK) "Sending link…" else "Send verification link")
+            }
+        }
+        state.message?.let { Text(it, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }) }
+        if (pending != null || state.needsProfileSync) {
+            OutlinedButton(onClick = onCheck, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                Text(if (state.action == EmailAction.CHECK_STATUS) "Checking…" else "Check verification status")
+            }
+        }
+        if (pending != null && !editRequest && !state.needsProfileSync) {
+            TextButton(onClick = { editRequest = true }, enabled = !state.busy) { Text("Use a different email") }
+        }
+        TextButton(onClick = onDismiss, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("Done") }
     }
 }
 

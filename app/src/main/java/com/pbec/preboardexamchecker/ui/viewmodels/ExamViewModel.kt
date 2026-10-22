@@ -6,6 +6,7 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pbec.preboardexamchecker.data.models.Exam
+import com.pbec.preboardexamchecker.data.models.ExamData
 import com.pbec.preboardexamchecker.data.models.Question
 import com.pbec.preboardexamchecker.data.repository.ExamRepository
 import com.pbec.preboardexamchecker.data.repository.IScanResultRepository
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import java.util.Date
 import java.util.Locale
 import javax.inject.Inject
@@ -45,9 +47,9 @@ class ExamViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
-            examRepository.getExamsBySubject(subject).collect {
-                _exams.value = it
-            }
+            examRepository.getExamsBySubject(subject)
+                .reportLoadErrors("Unable to load exams") { _message.value = it }
+                .collect { _exams.value = it }
         }
     }
 
@@ -126,6 +128,8 @@ class ExamViewModel @Inject constructor(
                 }
                 
                 _message.value = "Exam '$examName' generated successfully with ${selectedQuestions.size} questions $sourceInfo!"
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _message.value = "Error: ${e.message}"
             }
@@ -211,6 +215,8 @@ class ExamViewModel @Inject constructor(
             try {
                 archiveExamForStats(exam)
                 examRepository.deleteExam(exam)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _message.value = "Error deleting exam: ${e.message}"
             }
@@ -224,6 +230,8 @@ class ExamViewModel @Inject constructor(
                 archiveExamForStats(exam)
                 examRepository.deleteExam(exam)
                 scanResultRepository.moveExamRecordsToTrashCascade(exam.id)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _message.value = "Error deleting exam: ${e.message}"
             }
@@ -234,9 +242,9 @@ class ExamViewModel @Inject constructor(
      *  exam (and possibly its question bank) is gone. Best-effort: never blocks the deletion. */
     private suspend fun archiveExamForStats(exam: Exam) {
         runCatching {
-            val subjectQuestions = questionRepository.getAllQuestionsForSubjectOnce(exam.subject)
+            val subjectQuestions = questionRepository.getQuestionsForExam(exam)
             examRepository.archiveExam(exam, subjectQuestions)
-        }
+        }.onFailure { if (it is CancellationException) throw it }
     }
 
     fun renameExam(exam: Exam, newName: String) {
@@ -246,8 +254,10 @@ class ExamViewModel @Inject constructor(
         }
         viewModelScope.launch {
             try {
-                val updatedExam = exam.copy(examName = newName)
+                val updatedExam = exam.renamed(newName)
                 examRepository.updateExam(updatedExam)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _message.value = "Error renaming exam: ${e.message}"
             }
@@ -266,8 +276,8 @@ class ExamViewModel @Inject constructor(
                     _message.value = "Set $set has no questions to export."
                     return@launch
                 }
-                val allSubjectQuestions = questionRepository.getAllQuestionsForSubjectOnce(exam.subject)
-                val questions = ids.mapNotNull { id -> allSubjectQuestions.firstOrNull { it.id == id } }
+                val allSubjectQuestions = questionRepository.getQuestionsForExam(exam)
+                val questions = ExamData.orderedQuestions(exam, ids, allSubjectQuestions)
                 if (questions.isEmpty()) {
                     _message.value = "Set $set has no questions to export."
                     return@launch
@@ -275,6 +285,8 @@ class ExamViewModel @Inject constructor(
                 _message.value = "Exporting PDF... Please wait."
                 pdfExportUtil.exportExamToPdf(outputUri, "${exam.examName} - Set $set", exam.subject, questions)
                 _message.value = "PDF exported successfully!"
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _message.value = "Error exporting PDF: ${e.message}"
             }

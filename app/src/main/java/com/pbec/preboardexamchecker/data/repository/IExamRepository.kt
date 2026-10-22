@@ -5,6 +5,8 @@ import com.pbec.preboardexamchecker.data.models.Exam
 
 interface IExamRepository {
     suspend fun getExamsBySubjectOnce(subject: String): List<Exam>
+    suspend fun getExamsForOfflinePreparation(subject: String): List<Exam> =
+        throw UnsupportedOperationException("Server preparation is unavailable")
 
     /** Archived snapshot of a deleted exam, or null; rebuilds Exam Stats after the live exam is gone. */
     suspend fun getArchivedExamById(examId: Long): ArchivedExam?

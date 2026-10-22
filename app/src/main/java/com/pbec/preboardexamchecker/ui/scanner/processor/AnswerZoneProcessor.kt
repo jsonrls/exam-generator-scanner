@@ -108,12 +108,10 @@ class AnswerZoneProcessor(
         private const val ADAPTIVE_C = 8.0
 
         // ── Content-aware blur gate ───────────────────────────────────────────
-        // The still gate measures the raw bitmap's sparse center crop, pinning its floor very
-        // low. The warped answer grid is dense, so its Laplacian variance separates sharp from
-        // blurry cleanly; below the floor we return Recapture("BLURRY"). The floor is
-        // provisional — the variance is logged every frame; calibrate ANSWER_BLUR_VARIANCE_MIN
-        // from those on-device values (tools/validation/blur_metrics.py).
-        const val ENABLE_CONTENT_BLUR_GATE = true
+        // Diagnostic only until representative device captures calibrate this provisional
+        // floor. Marker, subject and answer-grid validation still apply to every capture.
+        // Calibration tooling: tools/validation/blur_metrics.py.
+        const val ENABLE_CONTENT_BLUR_GATE = false
         private const val ANSWER_BLUR_VARIANCE_MIN = 300.0
         // Band = union x-span of the 5 column regions, y from the grid top down (excludes the
         // blank subject header strip).

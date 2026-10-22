@@ -6,4 +6,6 @@ import com.pbec.preboardexamchecker.data.models.ExamCluster
 interface IExamClusterRepository {
     suspend fun getClustersOnce(): List<ExamCluster>
     suspend fun getClusterById(clusterId: Long): ExamCluster?
+    suspend fun getClustersForOfflinePreparation(): List<ExamCluster> =
+        throw UnsupportedOperationException("Server preparation is unavailable")
 }

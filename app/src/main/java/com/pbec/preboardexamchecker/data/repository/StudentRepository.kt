@@ -12,6 +12,14 @@ import javax.inject.Singleton
 class StudentRepository @Inject constructor(
     private val firestore: FirebaseFirestore
 ) : IStudentRepository {
+    override suspend fun getStudentsForOfflinePreparation(): List<Student> {
+        val uid = FirebaseAuth.getInstance().currentUser?.takeUnless { it.isAnonymous }?.uid
+            ?: error("Sign in before saving a session.")
+        return firestore.collection("students").get(com.google.firebase.firestore.Source.SERVER)
+            .await().documents.mapNotNull { it.toStudentCompat() }
+            .filter { (it.uploadedByUid.isBlank() || it.uploadedByUid == uid) &&
+                it.deletedAt == null && !it.isArchived }
+    }
     override suspend fun getAllStudents(): List<Student> {
         val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return emptyList()
         return try {

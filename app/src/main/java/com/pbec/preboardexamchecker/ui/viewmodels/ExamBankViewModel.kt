@@ -72,6 +72,7 @@ class ExamBankViewModel @Inject constructor(
             .map { questions ->
                 questions.groupBy { it.questionBankId }
             }
+            .reportLoadErrors("Unable to load question banks") { _message.value = it }
             .stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
 
     val generatedExamCountsByImportSession: StateFlow<Map<String, Int>> =
@@ -89,13 +90,14 @@ class ExamBankViewModel @Inject constructor(
                     examQuestionIds.any(sessionQuestionIds::contains)
                 }
             }
-        }.stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
+        }.reportLoadErrors("Unable to load generated exam counts") { _message.value = it }
+            .stateIn(viewModelScope, SharingStarted.Lazily, emptyMap())
 
     init {
         viewModelScope.launch {
-            questionRepository.getQuestionsBySubject(subject).collect { questions ->
-                _totalQuestionCount.value = questions.size
-            }
+            questionRepository.getQuestionsBySubject(subject)
+                .reportLoadErrors("Unable to load question count") { _message.value = it }
+                .collect { questions -> _totalQuestionCount.value = questions.size }
         }
     }
 

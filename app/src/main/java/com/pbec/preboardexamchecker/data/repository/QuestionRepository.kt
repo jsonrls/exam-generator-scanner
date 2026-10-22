@@ -5,6 +5,8 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.SetOptions
 import com.pbec.preboardexamchecker.data.models.Question
+import com.pbec.preboardexamchecker.data.models.Exam
+import com.pbec.preboardexamchecker.data.models.ExamData
 import com.pbec.preboardexamchecker.data.models.TrashedBank
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.async
@@ -14,6 +16,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.CancellationException
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -35,6 +38,9 @@ class QuestionRepository @Inject constructor(
 
         fun isDefaultQuestionBankId(questionBankId: String): Boolean =
             questionBankId.startsWith(DEFAULT_BANK_PREFIX)
+
+        // Imported documents may encode numeric fields as text; typed Firestore getters throw.
+        internal fun parseStoredLong(value: Any?): Long? = ExamData.storedLong(value)
     }
 
     suspend fun insertQuestions(questions: List<Question>): Int {
@@ -71,7 +77,7 @@ class QuestionRepository @Inject constructor(
                         snapshot.getString("questionText").orEmpty(),
                     )
                     if (signature.isEmpty()) return@mapNotNull null
-                    val existingId = snapshot.getLong("id")
+                    val existingId = parseStoredLong(snapshot.get("id"))
                         ?: snapshot.id.toLongOrNull()
                         ?: return@mapNotNull null
                     signature to (snapshot.reference to existingId)
@@ -136,9 +142,10 @@ class QuestionRepository @Inject constructor(
 
     fun getQuestionsBySubject(subject: String): Flow<List<Question>> {
         return callbackFlow {
-            val owner = runCatching { currentOwner() }.getOrElse {
-                trySend(emptyList())
-                awaitClose { }
+            val owner = try { currentOwner() } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                close(error)
                 return@callbackFlow
             }
 
@@ -150,19 +157,20 @@ class QuestionRepository @Inject constructor(
                 .collection(QUESTIONS_SUBCOLLECTION)
 
             fun publishQuestions() {
-                val visible = (defaultQuestionDocs + ownQuestionDocs)
-                    .distinctBy { it.id }
-                    .mapNotNull { it.toQuestion(bankId, true) }
-                    .filter { it.subject == subject }
-                    .sortedBy { it.questionNumber }
-                trySend(visible)
+                publishSnapshot {
+                    (defaultQuestionDocs + ownQuestionDocs)
+                        .distinctBy { it.id }
+                        .mapNotNull { it.toQuestion(bankId, true) }
+                        .filter { it.subject == subject }
+                        .sortedBy { it.questionNumber }
+                }
             }
 
             val ownedListener = questions
                 .whereEqualTo("uploadedByUid", owner.uid)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
-                        trySend(emptyList())
+                        close(error)
                         return@addSnapshotListener
                     }
                     ownQuestionDocs = snapshot?.documents.orEmpty()
@@ -172,7 +180,7 @@ class QuestionRepository @Inject constructor(
                 .whereEqualTo("isDefault", true)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
-                        trySend(emptyList())
+                        close(error)
                         return@addSnapshotListener
                     }
                     defaultQuestionDocs = snapshot?.documents.orEmpty()
@@ -187,12 +195,37 @@ class QuestionRepository @Inject constructor(
     }
 
     suspend fun getAllQuestionsForSubjectOnce(subject: String): List<Question> {
-        val owner = currentOwner()
+        return loadSubjectQuestions(subject, com.google.firebase.firestore.Source.DEFAULT)
+    }
+
+    suspend fun getQuestionsForExam(
+        exam: Exam,
+        source: com.google.firebase.firestore.Source = com.google.firebase.firestore.Source.DEFAULT,
+    ): List<Question> {
+        val owner = ownerForSource(source)
+        val banks = exam.selectedQuestionBankIds.ifEmpty { ExamData.bankIds(null, exam.subject) }
+        return loadQuestionsFromBanks(owner.uid, banks.map { AccessibleBank(it, true) }, source)
+            .filter { it.subject == exam.subject }
+    }
+
+    suspend fun getQuestionsForOfflinePreparation(subject: String): List<Question> =
+        loadSubjectQuestions(subject, com.google.firebase.firestore.Source.SERVER)
+
+    private suspend fun loadSubjectQuestions(subject: String, source: com.google.firebase.firestore.Source): List<Question> {
+        val owner = ownerForSource(source)
         val bank = AccessibleBank(defaultQuestionBankId(subject), true)
-        return loadQuestionsFromBanks(owner.uid, listOf(bank))
+        return loadQuestionsFromBanks(owner.uid, listOf(bank), source)
             .filter { it.subject == subject }
             .sortedWith(compareBy<Question> { it.questionBankId }.thenBy { it.questionNumber })
     }
+
+    private suspend fun ownerForSource(source: com.google.firebase.firestore.Source): QuestionOwner =
+        if (source == com.google.firebase.firestore.Source.SERVER) {
+            val uid = FirebaseAuth.getInstance().currentUser?.takeUnless { it.isAnonymous }?.uid
+                ?: error("Sign in before preparing a session.")
+            QuestionOwner(uid, context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+                .getString("teacher_id", null)?.trim()?.takeIf { it.isNotEmpty() } ?: uid)
+        } else currentOwner()
 
     suspend fun deleteQuestion(question: Question): Int {
         if (question.isDefault) return 0
@@ -268,8 +301,7 @@ class QuestionRepository @Inject constructor(
             val matchingDocs = docs.filter { doc ->
                 val docBankId = doc.getString("questionBankId")
                 val matchesBankId = docBankId == questionBankId
-                val legacyImportSession = doc.getLong("importSessionId")
-                    ?: doc.getString("importSessionId")?.toLongOrNull()
+                val legacyImportSession = parseStoredLong(doc.get("importSessionId"))
                 val matchesLegacyBank = questionBankId.startsWith("legacy_") &&
                     legacyImportSession?.let { "legacy_$it" == questionBankId } == true
                 matchesBankId || matchesLegacyBank
@@ -361,27 +393,31 @@ class QuestionRepository @Inject constructor(
     }
 
     fun getTrashedBanks(): Flow<List<TrashedBank>> = callbackFlow {
-        val owner = runCatching { currentOwner() }.getOrElse {
-            trySend(emptyList()); awaitClose { }; return@callbackFlow
+        val owner = try { currentOwner() } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            close(error)
+            return@callbackFlow
         }
         val listener = firestore.collection(QUESTION_BANKS_COLLECTION)
             .whereEqualTo("uploadedByTeacherId", owner.teacherId)
             .addSnapshotListener { snapshot, error ->
-                if (error != null) { trySend(emptyList()); return@addSnapshotListener }
-                val trashed = snapshot?.documents.orEmpty()
-                    .filter { it.getLong("deletedAt") != null }
-                    .map { doc ->
-                        TrashedBank(
-                            bankId = doc.id,
-                            displayName = doc.getString("displayName")
-                                ?: doc.getString("sourceFileName") ?: "Imported Bank",
-                            subject = doc.getString("subject") ?: "",
-                            questionCount = doc.getLong("questionCount")?.toInt() ?: 0,
-                            deletedAt = doc.getLong("deletedAt") ?: 0L,
-                        )
-                    }
-                    .sortedByDescending { it.deletedAt }
-                trySend(trashed)
+                if (error != null) { close(error); return@addSnapshotListener }
+                publishSnapshot {
+                    snapshot?.documents.orEmpty()
+                        .filter { it.get("deletedAt") != null }
+                        .map { doc ->
+                            TrashedBank(
+                                bankId = doc.id,
+                                displayName = doc.getString("displayName")
+                                    ?: doc.getString("sourceFileName") ?: "Imported Bank",
+                                subject = doc.getString("subject") ?: "",
+                                questionCount = parseStoredLong(doc.get("questionCount"))?.toInt() ?: 0,
+                                deletedAt = ExamData.timestampMillis(doc.get("deletedAt")),
+                            )
+                        }
+                        .sortedByDescending { it.deletedAt }
+                }
             }
         awaitClose { listener.remove() }
     }
@@ -441,6 +477,7 @@ class QuestionRepository @Inject constructor(
     private suspend fun loadQuestionsFromBanks(
         uid: String,
         banks: List<AccessibleBank>,
+        source: com.google.firebase.firestore.Source = com.google.firebase.firestore.Source.DEFAULT,
     ): List<Question> {
         if (banks.isEmpty()) return emptyList()
         // One round-trip per bank, fetched concurrently.
@@ -452,14 +489,14 @@ class QuestionRepository @Inject constructor(
                         .collection(QUESTIONS_SUBCOLLECTION)
                     val docs = if (bank.isDefault) {
                         val defaultDocs = async {
-                            query.whereEqualTo("isDefault", true).get().await().documents
+                            query.whereEqualTo("isDefault", true).get(source).await().documents
                         }
                         val teacherDocs = async {
-                            query.whereEqualTo("uploadedByUid", uid).get().await().documents
+                            query.whereEqualTo("uploadedByUid", uid).get(source).await().documents
                         }
                         (defaultDocs.await() + teacherDocs.await()).distinctBy { it.id }
                     } else {
-                        query.whereEqualTo("uploadedByUid", uid).get().await().documents
+                        query.whereEqualTo("uploadedByUid", uid).get(source).await().documents
                     }
                     docs.mapNotNull { it.toQuestion(bank.id, bank.isDefault) }
                 }
@@ -483,8 +520,7 @@ class QuestionRepository @Inject constructor(
         importSessionId: Long,
     ): List<com.google.firebase.firestore.DocumentSnapshot> {
         return col.whereEqualTo("uploadedByUid", uid).get().await().documents.filter { doc ->
-            doc.getLong("importSessionId") == importSessionId ||
-                doc.getString("importSessionId")?.toLongOrNull() == importSessionId
+            parseStoredLong(doc.get("importSessionId")) == importSessionId
         }
     }
 
@@ -539,25 +575,24 @@ class QuestionRepository @Inject constructor(
         containingBankId: String = reference.parent.parent?.id.orEmpty(),
         isDefaultBank: Boolean = false,
     ): Question? {
-        val subject = getString("subject") ?: return null
+        val subject = getString("subject") ?: error("Question $id has no subject.")
         val fileName = getString("fileName")
             ?: getString("sourceFileName")
             ?: "Imported Bank"
-        val questionText = getString("questionText") ?: return null
+        val questionText = getString("questionText")?.takeIf { it.isNotBlank() }
+            ?: error("Question $id has no question text.")
         val optionA = getString("optionA").orEmpty()
         val optionB = getString("optionB").orEmpty()
         val optionC = getString("optionC").orEmpty()
         val optionD = getString("optionD").orEmpty()
 
-        val fallbackId = id.hashCode().toLong().let { if (it < 0) -it else it }
-        val normalizedId = getLong("id") ?: fallbackId
+        val normalizedId = if (get("id") == null) id.toLongOrNull() ?: ExamData.legacyId(id)
+            else parseStoredLong(get("id")) ?: error("Question $id has an invalid numeric ID.")
 
-        val parsedImportSessionId = getLong("importSessionId")
-            ?: getString("importSessionId")?.toLongOrNull()
-            ?: 0L
+        val parsedImportSessionId = parseStoredLong(get("importSessionId")) ?: 0L
         val sourceFileName = getString("sourceFileName")
-        val parsedQuestionBankId = getString("questionBankId")
-            ?: containingBankId.takeIf { it.isNotBlank() }
+        val parsedQuestionBankId = containingBankId.takeIf { it.isNotBlank() }
+            ?: getString("questionBankId")
             ?: when {
                 parsedImportSessionId != 0L -> "legacy_$parsedImportSessionId"
                 !sourceFileName.isNullOrBlank() -> "legacy_file_${sourceFileName.trim().lowercase()}"
@@ -570,10 +605,7 @@ class QuestionRepository @Inject constructor(
             fileName = fileName,
             category = getString("category"),
             topic = getString("topic"),
-            questionNumber = getLong("questionNumber")?.toInt()
-                ?: getDouble("questionNumber")?.toInt()
-                ?: getString("questionNumber")?.toIntOrNull()
-                ?: 0,
+            questionNumber = parseStoredLong(get("questionNumber"))?.toInt() ?: 0,
             questionText = questionText,
             optionA = optionA,
             optionB = optionB,

@@ -2,7 +2,6 @@ package com.pbec.preboardexamchecker.ui.scanner
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
-import android.graphics.BitmapFactory
 import android.util.Log
 import com.pbec.preboardexamchecker.BuildConfig
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -44,6 +43,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import com.pbec.preboardexamchecker.ui.scanner.processor.MarkerDetector
 import com.pbec.preboardexamchecker.ui.scanner.processor.SharpnessChecker
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -87,7 +88,7 @@ fun ScanPhaseScreen(
     var cornerStates by remember { mutableStateOf(Array(4) { MarkerLockState.NOT_FOUND }) }
     val liveStateFlow = remember { MutableStateFlow(LiveMarkerState()) }
     val liveState by liveStateFlow.collectAsState()
-    val hasFired = remember { mutableStateOf(false) }
+    val captureGate = remember { CaptureGate() }
     // Covers the shutter-latency window — the one moment the user must hold still —
     // until the bitmap reaches the ViewModel and its "Reading…" overlay takes over.
     var capturing by remember { mutableStateOf(false) }
@@ -105,7 +106,7 @@ fun ScanPhaseScreen(
     LaunchedEffect(phase) {
         cornerStates = Array(4) { MarkerLockState.NOT_FOUND }
         liveStateFlow.value = LiveMarkerState()
-        hasFired.value = false
+        captureGate.reset()
         capturing = false
         // Clear analyzer EMA on phase change: phase 1 marker positions must not bleed
         // into phase 2's different geometry.
@@ -114,17 +115,16 @@ fun ScanPhaseScreen(
 
     LaunchedEffect(viewModel) {
         viewModel?.manualCaptureEvent?.collect {
-            if (!hasFired.value) {
-                val capture = imageCaptureUseCase ?: return@collect
+            val capture = imageCaptureUseCase ?: return@collect
+            if (captureGate.tryAcquire()) {
                 val capturePhase = phaseRef.get()
-                hasFired.value = true
                 capturing = true
                 triggerCapture(capture, context, capturePhase, scope,
                     onCapture = { bmp -> onCapture(capturePhase, bmp) },
                     onCaptureError = {
                         // Capture failed: ViewModel got no bitmap and can't re-arm, so
                         // re-arm here. On success it advances state / emits rearmCapture.
-                        hasFired.value = false
+                        captureGate.reset()
                         capturing = false
                         resetSignal.set(true)
                         cornerStates = Array(4) { MarkerLockState.NOT_FOUND }
@@ -136,7 +136,7 @@ fun ScanPhaseScreen(
 
     LaunchedEffect(viewModel) {
         viewModel?.rearmCapture?.collect {
-            hasFired.value = false
+            captureGate.reset()
             capturing = false
             resetSignal.set(true)
             cornerStates = Array(4) { MarkerLockState.NOT_FOUND }
@@ -164,7 +164,7 @@ fun ScanPhaseScreen(
                     }
                     val afIsReady = AtomicBoolean(false)
                     val imageCaptureBuilder = ImageCapture.Builder()
-                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     Camera2Interop.Extender(imageCaptureBuilder)
                         .setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
                             override fun onCaptureCompleted(
@@ -195,7 +195,7 @@ fun ScanPhaseScreen(
                         .build()
 
                     imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
-                        if (hasFired.value) { imageProxy.close(); return@setAnalyzer }
+                        if (captureGate.isBusy) { imageProxy.close(); return@setAnalyzer }
 
                         if (resetSignal.getAndSet(false)) {
                             for (i in 0..3) {
@@ -213,7 +213,7 @@ fun ScanPhaseScreen(
                             Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
                             src.release()
 
-                            val laplacianVariance = sharpnessChecker.variance(bitmap)
+                            val laplacianVariance = sharpnessChecker.varianceMat(gray)
                             val sharp = laplacianVariance >= 50.0
 
                             frameCount++
@@ -334,8 +334,8 @@ fun ScanPhaseScreen(
                                 stabilityProgress = stabilityProgress
                             )
 
-                            if (allGreen && !hasFired.value && afIsReady.get()) {
-                                hasFired.value = true
+                            if (allGreen && afIsReady.get() &&
+                                viewModel?.blurRetryExhausted?.value != true && captureGate.tryAcquire()) {
                                 // Locked positions (analysis-frame fractions) narrow the still
                                 // detector's search AND back the WYSIWYG gate that re-captures
                                 // if the still locks onto different squares.
@@ -353,7 +353,7 @@ fun ScanPhaseScreen(
                                             // Re-arm ONLY on failed capture. Re-arming on success
                                             // fired a second auto-capture mid-processing whose late
                                             // failure clobbered the result.
-                                            hasFired.value = false
+                                            captureGate.reset()
                                             capturing = false
                                             resetSignal.set(true)
                                             cornerStates = Array(4) { MarkerLockState.NOT_FOUND }
@@ -512,7 +512,7 @@ fun ScanPhaseScreen(
 
         // Stability arc for the nav Capture button, pushed to the ViewModel so the nav
         // bar renders it. Zero once fired/processing, so the arc clears as the shutter fires.
-        val navArcProgress = if (!hasFired.value &&
+        val navArcProgress = if (!captureGate.isBusy &&
             (effectivePhase == OverlayPhase.SEARCHING || effectivePhase == OverlayPhase.HOLD_STILL)
         ) effectiveState.stabilityProgress else 0f
         LaunchedEffect(navArcProgress) { viewModel?.setCaptureProgress(navArcProgress) }
@@ -538,37 +538,45 @@ internal fun triggerCapture(
     onCapture: (android.graphics.Bitmap) -> Unit,
     onCaptureError: () -> Unit
 ) {
-    val file = java.io.File(context.cacheDir, "capture_phase${phase}_${System.currentTimeMillis()}.jpg")
-    val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
     imageCapture.takePicture(
-        outputOptions,
         ContextCompat.getMainExecutor(context),
-        object : ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                scope.launch(Dispatchers.IO) {
-                    val bytes = output.savedUri
-                        ?.let { context.contentResolver.openInputStream(it)?.readBytes() }
-                        ?: run {
-                            Log.e("AutoCapture", "PIPELINE ERROR — could not read saved bytes")
-                            withContext(Dispatchers.Main) { onCaptureError() }
-                            return@launch
+        object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                // Install cleanup even when the screen's scope was already cancelled.
+                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                    var bitmap: android.graphics.Bitmap? = null
+                    var delivered = false
+                    try {
+                        try {
+                            withContext(Dispatchers.Default) {
+                                // Store before crossing dispatchers so cancellation cannot lose it.
+                                bitmap = image.toBitmap()
+                                val source = checkNotNull(bitmap)
+                                val upright = rotateCaptureBitmap(source, image.imageInfo.rotationDegrees)
+                                bitmap = upright
+                                if (upright !== source) source.recycle()
+                            }
+                        } finally {
+                            image.close()
                         }
-                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: run {
-                        Log.e("AutoCapture", "PIPELINE ERROR — BitmapFactory returned null")
+                        withContext(Dispatchers.Main) {
+                            onCapture(checkNotNull(bitmap))
+                            delivered = true
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Log.e("AutoCapture", "Capture conversion failed phase=$phase", error)
                         withContext(Dispatchers.Main) { onCaptureError() }
-                        return@launch
-                    }
-                    val corrected = applyExifRotation(bytes, bitmap)
-                    if (corrected !== bitmap) bitmap.recycle()
-                    withContext(Dispatchers.Main) {
-                        onCapture(corrected)
+                    } finally {
+                        if (!delivered) bitmap?.recycle()
                     }
                 }
             }
             override fun onError(exception: ImageCaptureException) {
                 Log.e("AutoCapture", "CAPTURE FAILED — ${exception.imageCaptureError}: ${exception.message}")
                 Log.e("ScanPhaseScreen", "Capture failed", exception)
-                onCaptureError()
+                scope.launch(Dispatchers.Main) { onCaptureError() }
             }
         }
     )
@@ -733,4 +741,3 @@ private fun ScanPhaseOverlay(
         }
     }
 }
-

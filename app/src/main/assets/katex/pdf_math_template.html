@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="katex.min.css">
+    <style>
+        html, body { margin: 0; padding: 0; background: white; color: black; }
+        #latexOutput {
+            display: inline-block;
+            width: max-content;
+            padding: 2px;
+            white-space: nowrap;
+            line-height: 1.2;
+        }
+        .katex { font-size: 1em; }
+        .katex-display { margin: 0; }
+    </style>
+    <script defer src="katex.min.js"></script>
+</head>
+<body>
+<div id="latexOutput"></div>
+<script>
+    let activeRequest;
+    window.androidCallback = {
+        render: async function (latex, fontSize, request) {
+            activeRequest = request;
+            const output = document.getElementById('latexOutput');
+            output.replaceChildren();
+            output.style.fontSize = fontSize + 'px';
+            try {
+                katex.render(latex, output, {
+                    throwOnError: true, displayMode: false, output: 'html',
+                    strict: 'ignore', trust: false
+                });
+                // Trigger layout before awaiting the fonts requested by this formula.
+                output.getBoundingClientRect();
+                await document.fonts.ready;
+                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                if (activeRequest !== request) return;
+                const rect = output.getBoundingClientRect();
+                console.log('js-callback://renderComplete?request=' + request +
+                    '&width=' + rect.width + '&height=' + rect.height +
+                    '&viewportWidth=' + window.innerWidth);
+            } catch (error) {
+                if (activeRequest !== request) return;
+                console.log('js-callback://renderError?request=' + request +
+                    '&message=' + encodeURIComponent(error.message));
+            }
+        }
+    };
+</script>
+</body>
+</html>

@@ -2,6 +2,12 @@ package com.pbec.preboardexamchecker.ui.scanner
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.google.firebase.auth.FirebaseAuth
+import com.pbec.preboardexamchecker.data.models.ExamCluster
+import com.pbec.preboardexamchecker.data.models.ExamData
+import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeout
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pbec.preboardexamchecker.data.models.ScanResult
@@ -17,8 +23,8 @@ import com.pbec.preboardexamchecker.ui.scanner.processor.ScanContext
 import com.pbec.preboardexamchecker.ui.scanner.processor.ScannedInfo
 import com.pbec.preboardexamchecker.ui.scanner.processor.SharpnessChecker
 import com.pbec.preboardexamchecker.ui.scanner.processor.SingleCaptureProcessor
+import com.pbec.preboardexamchecker.ui.scanner.processor.StudentIdMatcher
 import com.pbec.preboardexamchecker.ui.scanner.scoring.ScoringStrategy
-import com.pbec.preboardexamchecker.domain.pdf.ReportPdfStyle
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Deferred
@@ -54,6 +60,139 @@ class ScannerViewModel @Inject constructor(
 
     private val _state = MutableStateFlow<ScanSessionState>(ScanSessionState.Setup)
     val state: StateFlow<ScanSessionState> = _state.asStateFlow()
+
+    data class SetupState(
+        val clusters: List<ExamCluster> = emptyList(),
+        val saved: List<SavedScanSession> = emptyList(),
+        val loading: Boolean = false,
+        val preparingId: Long? = null,
+        val message: String? = null,
+        val serverLoaded: Boolean = false,
+    )
+
+    private val offlineStore = OfflineSessionStore(File(appContext.noBackupFilesDir, "scan_sessions"))
+    private val _setup = MutableStateFlow(SetupState())
+    val setup: StateFlow<SetupState> = _setup.asStateFlow()
+    private var setupJob: Job? = null
+    private var sessionLoadJob: Job? = null
+    private var sessionOwnerUid: String? = null
+    private var catalogOwnerUid: String? = null
+
+    fun clearSetupMessage() {
+        _setup.value = _setup.value.copy(message = null)
+    }
+
+    private fun isAccessDenied(error: Exception): Boolean =
+        error is com.google.firebase.firestore.FirebaseFirestoreException && error.code in listOf(
+            com.google.firebase.firestore.FirebaseFirestoreException.Code.PERMISSION_DENIED,
+            com.google.firebase.firestore.FirebaseFirestoreException.Code.UNAUTHENTICATED)
+
+    private fun signedInOwner(): String = FirebaseAuth.getInstance().currentUser
+        ?.takeUnless { it.isAnonymous }?.uid ?: error("Sign in before opening a scan session.")
+
+    private fun requireOwner(uid: String) {
+        check(signedInOwner() == uid) { "Your account changed. Open the session again." }
+    }
+
+    fun refreshSessionCatalog() {
+        if (_setup.value.preparingId != null) return
+        setupJob?.cancel()
+        setupJob = viewModelScope.launch {
+            val owner = runCatching { signedInOwner() }.getOrElse {
+                _setup.value = SetupState(message = it.message); return@launch
+            }
+            _setup.value = if (catalogOwnerUid == owner) _setup.value.copy(loading = true, message = null)
+                else SetupState(loading = true)
+            catalogOwnerUid = owner
+            try {
+                val saved = withContext(Dispatchers.IO) { offlineStore.list(owner) }
+                requireOwner(owner)
+                _setup.value = _setup.value.copy(clusters = (_setup.value.clusters + saved.map { it.cluster })
+                    .distinctBy { it.id }, saved = saved, loading = true)
+                val remote = withTimeout(15_000) { clusterRepository.getClustersForOfflinePreparation() }
+                requireOwner(owner)
+                // A server-confirmed deletion or changed exam mapping invalidates the old package.
+                val retained = saved.filter { local -> remote.any {
+                    it.id == local.cluster.id && it.examIdsBySubject == local.cluster.examIdsBySubject
+                } }
+                withContext(Dispatchers.IO) {
+                    saved.filterNot { it in retained }
+                        .forEach { offlineStore.remove(owner, it.cluster.id) }
+                }
+                requireOwner(owner)
+                _setup.value = SetupState(remote, retained, serverLoaded = true)
+            } catch (e: Exception) {
+                if (e is CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
+                if (runCatching { signedInOwner() }.getOrNull() != owner) {
+                    _setup.value = SetupState(message = "Your account changed. Open this screen again.")
+                } else {
+                    if (isAccessDenied(e)) {
+                        withContext(Dispatchers.IO) {
+                            offlineStore.list(owner).forEach { offlineStore.remove(owner, it.cluster.id) }
+                        }
+                        _setup.value = SetupState(message = "Access to these sessions was removed. Sign in again and prepare an available cluster.")
+                        return@launch
+                    }
+                    _setup.value = _setup.value.copy(loading = false,
+                        message = "Couldn’t refresh clusters. You can use a saved session, or reconnect and retry.")
+                }
+            }
+        }
+    }
+
+    fun prepareOfflineSession(clusterId: Long) {
+        if (_setup.value.preparingId != null) return
+        setupJob?.cancel()
+        setupJob = viewModelScope.launch {
+            val owner = runCatching { signedInOwner() }.getOrElse {
+                _setup.value = SetupState(message = it.message); return@launch
+            }
+            _setup.value = _setup.value.copy(loading = false, preparingId = clusterId, message = null)
+            try {
+                val prepared = withTimeout(30_000) {
+                    val cluster = clusterRepository.getClustersForOfflinePreparation().firstOrNull { it.id == clusterId }
+                        ?: throw MissingPreparedCluster()
+                    require(cluster.examIdsBySubject.keys == OfflineSessionStore.subjects.toSet()) {
+                        "The cluster must include Mathematics, ESAS, and Professional EE."
+                    }
+                    val students = studentRepository.getStudentsForOfflinePreparation()
+                    val contexts = coroutineScope {
+                        OfflineSessionStore.subjects.map { subject -> async {
+                            buildScanContext(subject, cluster.examIdsBySubject.getValue(subject),
+                                cluster.id, cluster.name, students, serverOnly = true)
+                        } }.awaitAll()
+                    }
+                    SavedScanSession(owner, cluster, System.currentTimeMillis(), contexts)
+                }
+                requireOwner(owner)
+                withContext(Dispatchers.IO) {
+                    requireOwner(owner)
+                    offlineStore.save(prepared)
+                }
+                requireOwner(owner)
+                val saved = withContext(Dispatchers.IO) { offlineStore.list(owner) }
+                requireOwner(owner)
+                _setup.value = _setup.value.copy(saved = saved, preparingId = null,
+                    message = "Ready for offline scanning. Saved results will sync when you’re back online.")
+            } catch (e: Exception) {
+                if (e is CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
+                if (runCatching { signedInOwner() }.getOrNull() != owner) {
+                    _setup.value = SetupState(message = "Your account changed. Open this screen again.")
+                    return@launch
+                }
+                val invalid = e is MissingPreparedCluster || e is MissingPreparedExam || isAccessDenied(e)
+                if (invalid) withContext(Dispatchers.IO) { offlineStore.remove(owner, clusterId) }
+                if (runCatching { signedInOwner() }.getOrNull() != owner) return@launch
+                _setup.value = _setup.value.copy(preparingId = null,
+                    saved = if (invalid) _setup.value.saved.filterNot { it.cluster.id == clusterId } else _setup.value.saved,
+                    message = if (invalid) "This session is no longer available to your account. Refresh the cluster list." else if (e is IllegalArgumentException) e.message else
+                        "Couldn’t save this session. Check your connection and account, then retry. Any previous complete saved copy is retained unless access was removed.")
+            }
+        }
+    }
+
+    private class MissingPreparedCluster : IllegalStateException("This cluster is no longer available.")
+    private class MissingPreparedExam(subject: String) : IllegalStateException("The $subject exam is no longer available.")
 
     // Drives the bottom-nav Capture button: capture circle vs default Search icon.
     val sessionActive: StateFlow<Boolean> = state
@@ -205,11 +344,7 @@ class ScannerViewModel @Inject constructor(
     // Reject only EXTREME blur until calibrated from logged "still variance=" values.
     private val stillBlurVarianceMin = 15.0
 
-    // Content blur gate force-recaptures up to blurBudget (re-shoot, don't grade a
-    // blurry sheet); only then offer a manual "Capture anyway". Separate from
-    // recaptureCount, which also covers WYSIWYG divergence and falls back silently.
-    private var blurRecaptureCount = 0
-    private val blurBudget = 6
+    private val blurRetryPolicy = BlurRetryPolicy()
     @Volatile
     private var forceAcceptNextCapture = false
 
@@ -218,14 +353,36 @@ class ScannerViewModel @Inject constructor(
     val blurRetryExhausted: StateFlow<Boolean> = _blurRetryExhausted.asStateFlow()
 
     private fun resetBlurState() {
-        blurRecaptureCount = 0
+        blurRetryPolicy.reset()
         forceAcceptNextCapture = false
         _blurRetryExhausted.value = false
     }
 
+    private val authListener = FirebaseAuth.AuthStateListener { auth ->
+        val owner = auth.currentUser?.takeUnless { it.isAnonymous }?.uid
+        if ((catalogOwnerUid != null && catalogOwnerUid != owner) ||
+            (sessionOwnerUid != null && sessionOwnerUid != owner)) {
+            setupJob?.cancel()
+            sessionLoadJob?.cancel()
+            pendingScanResult = null
+            clearPendingRawCapture()
+            endSession()
+            catalogOwnerUid = null
+            _setup.value = SetupState(message = "Your account changed. Refresh the cluster list.")
+        }
+    }
+
+    init { FirebaseAuth.getInstance().addAuthStateListener(authListener) }
+
+    override fun onCleared() {
+        FirebaseAuth.getInstance().removeAuthStateListener(authListener)
+        clearPendingMismatchBitmap()
+        clearPendingRawCapture()
+        super.onCleared()
+    }
+
     fun forceAcceptCapture() {
         forceAcceptNextCapture = true
-        _blurRetryExhausted.value = false
         requestManualCapture()
     }
 
@@ -241,20 +398,34 @@ class ScannerViewModel @Inject constructor(
         clusterId: Long? = null,
         clusterName: String? = null,
     ) {
+        sessionLoadJob?.cancel()
+        val epoch = ++sessionEpoch
+        _processing.value = null
         this.replaceResultId = replaceResultId
+        resetBlurState()
         scanMode = mode ?: ScanSettings.getMode(appContext)
         _scanModeFlow.value = scanMode
         resetSingleFailures()
         clusterContexts = null  // single-exam path: no auto-routing
-        viewModelScope.launch {
+        sessionLoadJob = viewModelScope.launch {
             _state.value = ScanSessionState.Loading
             try {
-                val ctx = buildScanContext(subject, examId, clusterId, clusterName)
+                val owner = signedInOwner()
+                val saved = withContext(Dispatchers.IO) { offlineStore.list(owner) }
+                    .flatMap { it.contexts }.firstOrNull { it.examId == examId && it.subject == subject &&
+                        (clusterId == null || it.clusterId == clusterId) }
+                val ctx = saved?.copy(clusterId = clusterId, clusterName = clusterName)
+                    ?: withTimeout(30_000) { buildScanContext(subject, examId, clusterId, clusterName, serverOnly = true) }
+                requireOwner(owner)
+                if (epoch != sessionEpoch) return@launch
+                sessionOwnerUid = owner
                 currentContext = ctx
                 activeContext = ctx
                 _activeSubject.value = ctx.subject
                 _state.value = initialCaptureState(ctx)
             } catch (e: Exception) {
+                if (e is CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
+                if (epoch != sessionEpoch) return@launch
                 _state.value = ScanSessionState.Error(
                     reason = e.message ?: "Failed to load session",
                     phase = 0
@@ -270,35 +441,28 @@ class ScannerViewModel @Inject constructor(
      * the cluster still raises the manual mismatch dialog.
      */
     fun loadClusterSession(clusterId: Long, mode: ScanMode? = null) {
+        setupJob?.cancel()
+        _setup.value = _setup.value.copy(loading = false, preparingId = null)
+        sessionLoadJob?.cancel()
+        val epoch = ++sessionEpoch
+        _processing.value = null
+        resetBlurState()
         replaceResultId = null
         scanMode = mode ?: ScanSettings.getMode(appContext)
         _scanModeFlow.value = scanMode
         resetSingleFailures()
-        viewModelScope.launch {
+        sessionLoadJob = viewModelScope.launch {
             _state.value = ScanSessionState.Loading
             try {
-                val cluster = clusterRepository.getClusterById(clusterId)
-                    ?: throw IllegalStateException("Cluster not found")
-                // Canonical subject order so the seeded subject is deterministic (Math first).
-                val ordered = ReportPdfStyle.subjectOrder.mapNotNull { subject ->
-                    cluster.examIdsBySubject[subject]?.let { subject to it }
+                val owner = signedInOwner()
+                val saved = withContext(Dispatchers.IO) { offlineStore.read(owner, clusterId) }
+                    ?: error("Connect once and prepare this cluster for offline scanning.")
+                requireOwner(owner)
+                if (epoch != sessionEpoch) return@launch
+                sessionOwnerUid = owner
+                val contexts = OfflineSessionStore.subjects.associateWith { subject ->
+                    saved.contexts.first { it.subject == subject }
                 }
-                // One student fetch shared across subjects; contexts built concurrently.
-                val students = try { studentRepository.getAllStudents() } catch (e: Exception) { emptyList() }
-                val contextResults = coroutineScope {
-                    ordered.map { (subject, examId) ->
-                        async {
-                            runCatching {
-                                buildScanContext(subject, examId, cluster.id, cluster.name, students)
-                            }
-                        }
-                    }.awaitAll()
-                }
-                val contexts = LinkedHashMap<String, ScanContext>()
-                for ((index, result) in contextResults.withIndex()) {
-                    result.onSuccess { contexts[ordered[index].first] = it }
-                }
-                if (contexts.isEmpty()) throw IllegalStateException("Cluster has no loadable exams")
                 clusterContexts = contexts
                 val first = contexts.values.first()
                 currentContext = first
@@ -306,6 +470,8 @@ class ScannerViewModel @Inject constructor(
                 _activeSubject.value = first.subject
                 _state.value = initialCaptureState(first)
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                if (epoch != sessionEpoch) return@launch
                 clusterContexts = null
                 _state.value = ScanSessionState.Error(
                     reason = e.message ?: "Failed to load cluster",
@@ -322,43 +488,36 @@ class ScannerViewModel @Inject constructor(
         clusterId: Long? = null,
         clusterName: String? = null,
         preloadedStudents: List<Student>? = null,
+        serverOnly: Boolean = false,
     ): ScanContext = coroutineScope {
         // Independent fetches run concurrently; load is bound by the slowest, not the sum.
         // Cluster path resolves students once and passes them via preloadedStudents.
         val studentsDeferred: Deferred<List<Student>>? = if (preloadedStudents != null) null
-            else async { try { studentRepository.getAllStudents() } catch (e: Exception) { emptyList() } }
-        val examsDeferred = async { examRepository.getExamsBySubjectOnce(subject) }
-        val questionsDeferred = async { questionRepository.getAllQuestionsForSubjectOnce(subject) }
+            else async { if (serverOnly) studentRepository.getStudentsForOfflinePreparation()
+                else studentRepository.getAllStudents() }
+        val examsDeferred = async { if (serverOnly) examRepository.getExamsForOfflinePreparation(subject)
+            else examRepository.getExamsBySubjectOnce(subject) }
 
         val students = preloadedStudents ?: studentsDeferred!!.await()
-        val studentMap = students.associateBy { it.studentId }
 
         val exam = examsDeferred.await()
             .firstOrNull { it.id == examId }
-            ?: throw IllegalStateException("Exam $examId not found for $subject")
+            ?: throw MissingPreparedExam(subject)
 
         // Legacy exams may have an empty Set B; fall back to Set A's order/key in that case.
         val setAQuestionIds = exam.setAQuestionIds
         val setBQuestionIds = exam.setBQuestionIds.takeIf { it.isNotEmpty() } ?: setAQuestionIds
 
-        // Questions live in Firestore, not Room (Room returns nothing here -> old 0/0).
-        // getAllQuestionsForSubjectOnce spans all banks, so two questions can share an id
-        // with different correctAnswers. Resolve each id to the FIRST in (bank, number)
-        // order, matching the printed PDF / key grid; associateBy kept the LAST and
-        // mis-graded colliding items.
-        val subjectQuestions = questionsDeferred.await()
-        val keyById = HashMap<Long, String?>()
-        for (q in subjectQuestions) if (!keyById.containsKey(q.id)) keyById[q.id] = q.correctAnswer
-
-        val setAKeyMap: Map<Long, String?> =
-            setAQuestionIds.associateWith { keyById[it] }
-        val setBKeyMap: Map<Long, String?> =
-            setBQuestionIds.associateWith { keyById[it] }
+        val questionSource = if (serverOnly) com.google.firebase.firestore.Source.SERVER
+            else com.google.firebase.firestore.Source.DEFAULT
+        val subjectQuestions = questionRepository.getQuestionsForExam(exam, questionSource)
+        val setAKeyMap = ExamData.answerKey(exam, setAQuestionIds, subjectQuestions)
+        val setBKeyMap = ExamData.answerKey(exam, setBQuestionIds, subjectQuestions)
 
         android.util.Log.d(
             "Scoring",
             "loadSession exam=$examId setA=${setAQuestionIds.size} setB=${setBQuestionIds.size} " +
-                "questionsLoaded=${subjectQuestions.size} uniqueIds=${keyById.size} " +
+                "questionsLoaded=${subjectQuestions.size} " +
                 "setAWithKey=${setAKeyMap.values.count { it != null }} " +
                 "setBWithKey=${setBKeyMap.values.count { it != null }}"
         )
@@ -371,10 +530,10 @@ class ScannerViewModel @Inject constructor(
             setBQuestionIds = setBQuestionIds,
             setAKeyMap = setAKeyMap,
             setBKeyMap = setBKeyMap,
-            studentMap = studentMap,
+            students = students,
             clusterId = clusterId,
             clusterName = clusterName,
-        )
+        ).also(OfflineSessionStore::validateContext)
     }
 
     /** Held frame's subject is in the cluster: swap to its prebuilt context and re-score in place. */
@@ -386,26 +545,41 @@ class ScannerViewModel @Inject constructor(
         rescoreHeldBitmap(ctx)
     }
 
+    private fun canProcessCapture(bitmap: Bitmap): Boolean {
+        if (_processing.value != null) { bitmap.recycle(); return false }
+        if (sessionOwnerUid == null || runCatching { signedInOwner() }.getOrNull() != sessionOwnerUid) {
+            bitmap.recycle()
+            endSession()
+            _state.value = ScanSessionState.Error("Sign in again before scanning.", 0)
+            return false
+        }
+        return true
+    }
+
     fun processPhase1(bitmap: Bitmap) {
+        if (!canProcessCapture(bitmap)) return
         android.util.Log.d("AutoCapture", "VIEWMODEL received — processPhase1 bitmap:${bitmap.width}x${bitmap.height} state:${_state.value::class.simpleName}")
         val currentState = _state.value as? ScanSessionState.Phase1 ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processPhase1 called in wrong state: ${_state.value::class.simpleName}")
-            viewModelScope.launch { _rearmCapture.emit(Unit) }
+            bitmap.recycle()
             return
         }
         val ctx = currentContext ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processPhase1: currentContext is null")
+            bitmap.recycle()
             return
         }
         val hints = lockedMarkerHints.also { lockedMarkerHints = null }
+        val bypassBlur = forceAcceptNextCapture.also { forceAcceptNextCapture = false }
         val epoch = sessionEpoch
+        _processing.value = "Reading student info…"
         viewModelScope.launch {
-            if (rejectAsBlurry(bitmap)) { bitmap.recycle(); return@launch }
             android.util.Log.d("AutoCapture", "PROCESSING START — InfoZoneProcessor.process()")
             _processing.value = "Reading student info…"
             val result = try {
+                if (!bypassBlur && rejectAsBlurry(bitmap, epoch)) return@launch
                 withContext(Dispatchers.Default) {
-                    infoProcessor.process(bitmap, ctx.studentMap, hints, debugContext = debugCtx)
+                    infoProcessor.process(bitmap, ctx.students, hints, debugContext = debugCtx)
                 }
             } catch (e: Exception) {
                 android.util.Log.e("AutoCapture", "PIPELINE ERROR", e)
@@ -414,6 +588,8 @@ class ScannerViewModel @Inject constructor(
                 toast("Scan failed — reposition and try again")
                 _rearmCapture.emit(Unit)
                 return@launch
+            } finally {
+                bitmap.recycle()
             }
             if (epoch != sessionEpoch) return@launch
             _processing.value = null
@@ -421,6 +597,7 @@ class ScannerViewModel @Inject constructor(
             when (result) {
                 is InfoZoneProcessor.Result.Success -> {
                     recaptureCount = 0
+                    resetBlurState()
                     currentScannedInfo = result.info
                     _state.value = ScanSessionState.Phase1Review(result.info)
                 }
@@ -431,35 +608,35 @@ class ScannerViewModel @Inject constructor(
                     _rearmCapture.emit(Unit)
                 }
                 is InfoZoneProcessor.Result.Error -> {
-                    toast(
-                        if (result.reason.startsWith("BLURRY"))
-                            "Too blurry — hold steady and wait for focus"
-                        else
-                            "Couldn't read info panel — reposition and try again"
-                    )
-                    _rearmCapture.emit(Unit)
+                    _state.value = ScanSessionState.Error(result.reason, phase = 1)
                 }
             }
         }
     }
 
-    // True (and emits a retake) when the still is too blurry AND budget remains;
-    // false when acceptable or budget spent (read best-effort).
-    private suspend fun rejectAsBlurry(bitmap: Bitmap): Boolean {
+    private suspend fun rejectAsBlurry(bitmap: Bitmap, epoch: Int): Boolean {
         val v = withContext(Dispatchers.Default) { sharpnessChecker.variance(bitmap) }
+        if (epoch != sessionEpoch) return true
         android.util.Log.d("AutoCapture", "still variance=%.1f (floor %.1f, retakes %d/%d)"
             .format(v, stillBlurVarianceMin, recaptureCount, maxRecaptures))
-        if (recaptureCount >= maxRecaptures) return false
-        if (v >= stillBlurVarianceMin) return false
-        recaptureCount++
-        android.util.Log.w("AutoCapture", "Still too blurry — retake %d/%d".format(recaptureCount, maxRecaptures))
-        toast("Too blurry — hold steady and wait for focus")
+        // Sparse paper can have low variance even when perfectly focused. Keep this as
+        // diagnostics; the actual processors decide whether marker/answer reading succeeded.
+        return false
+    }
+
+    private suspend fun handleBlurFailure() {
+        _processing.value = null
+        _blurRetryExhausted.value = blurRetryPolicy.recordFailure()
+        toast(if (_blurRetryExhausted.value)
+            "Automatic retries paused — reposition, then tap Capture or Capture anyway"
+        else "Too blurry — hold steady and wait for focus")
+        // Clear shutter state for manual retry. Screens suppress auto-capture when paused.
         _rearmCapture.emit(Unit)
-        return true
     }
 
     fun retryPhase1() {
         recaptureCount = 0
+        resetBlurState()
         val ctx = activeContext
         if (ctx != null) {
             // Same phase, so the persistent camera won't auto-reset on a phase change.
@@ -479,41 +656,46 @@ class ScannerViewModel @Inject constructor(
     }
 
     fun processPhase2(bitmap: Bitmap) {
+        if (!canProcessCapture(bitmap)) return
         android.util.Log.d("AutoCapture", "VIEWMODEL received — processPhase2 bitmap:${bitmap.width}x${bitmap.height} state:${_state.value::class.simpleName}")
         _state.value as? ScanSessionState.Phase2 ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processPhase2 called in wrong state: ${_state.value::class.simpleName}")
-            viewModelScope.launch { _rearmCapture.emit(Unit) }
+            bitmap.recycle()
             return
         }
         val ctx = currentContext ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processPhase2: currentContext is null")
+            bitmap.recycle()
             return
         }
         val info = currentScannedInfo ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processPhase2: currentScannedInfo is null")
+            bitmap.recycle()
             return
         }
         val hints = lockedMarkerHints.also { lockedMarkerHints = null }
         val bypassBlur = forceAcceptNextCapture.also { forceAcceptNextCapture = false }
         val epoch = sessionEpoch
+        _processing.value = "Reading answers…"
         viewModelScope.launch {
-            if (!bypassBlur && rejectAsBlurry(bitmap)) { bitmap.recycle(); return@launch }
             android.util.Log.d("AutoCapture", "PROCESSING START — AnswerZoneProcessor.process()")
             _processing.value = "Reading answers…"
             val result = try {
+                if (!bypassBlur && rejectAsBlurry(bitmap, epoch)) { bitmap.recycle(); return@launch }
                 withContext(Dispatchers.Default) {
                     answerProcessor.process(bitmap, ctx, info, scoringStrategy, hints,
                         debugContext = debugCtx, bypassBlurGate = bypassBlur)
                 }
             } catch (e: Exception) {
                 android.util.Log.e("AutoCapture", "PIPELINE ERROR", e)
+                bitmap.recycle()
                 if (epoch != sessionEpoch) return@launch
                 _processing.value = null
                 toast("Scan failed — reposition and try again")
                 _rearmCapture.emit(Unit)
                 return@launch
             }
-            if (epoch != sessionEpoch) return@launch
+            if (epoch != sessionEpoch) { bitmap.recycle(); return@launch }
             _processing.value = null
             android.util.Log.d("AutoCapture", "PROCESSING DONE — result:$result")
             when (result) {
@@ -543,17 +725,9 @@ class ScannerViewModel @Inject constructor(
                     }
                 }
                 is AnswerZoneProcessor.Result.Recapture -> {
+                    bitmap.recycle()
                     if (result.reason.startsWith("BLURRY")) {
-                        blurRecaptureCount++
-                        android.util.Log.w("AutoCapture",
-                            "BLURRY retake ${blurRecaptureCount}/$blurBudget — ${result.reason}")
-                        if (blurRecaptureCount > blurBudget) {
-                            _blurRetryExhausted.value = true
-                            toast("Still blurry — tap “Capture anyway” to use this shot")
-                        } else {
-                            toast("Too blurry — hold steady and wait for focus")
-                        }
-                        _rearmCapture.emit(Unit)
+                        handleBlurFailure()
                     } else {
                         recaptureCount++
                         android.util.Log.w("AutoCapture", "WYSIWYG retake ${recaptureCount}/$maxRecaptures — ${result.reason}")
@@ -562,6 +736,7 @@ class ScannerViewModel @Inject constructor(
                     }
                 }
                 is AnswerZoneProcessor.Result.Error -> {
+                    bitmap.recycle()
                     toast("Couldn't read answer sheet — flatten the paper and try again")
                     _rearmCapture.emit(Unit)
                 }
@@ -571,23 +746,26 @@ class ScannerViewModel @Inject constructor(
 
     // Read both zones from one full-sheet frame. Failures count toward suggestTwoPhase.
     fun processSingle(bitmap: Bitmap) {
+        if (!canProcessCapture(bitmap)) return
         android.util.Log.d("AutoCapture", "VIEWMODEL received — processSingle bitmap:${bitmap.width}x${bitmap.height} state:${_state.value::class.simpleName}")
         _state.value as? ScanSessionState.SingleCapture ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processSingle called in wrong state: ${_state.value::class.simpleName}")
-            viewModelScope.launch { _rearmCapture.emit(Unit) }
+            bitmap.recycle()
             return
         }
         val ctx = currentContext ?: run {
             android.util.Log.e("AutoCapture", "PIPELINE ERROR — processSingle: currentContext is null")
+            bitmap.recycle()
             return
         }
         val hints = lockedMarkerHints.also { lockedMarkerHints = null }
         val bypassBlur = forceAcceptNextCapture.also { forceAcceptNextCapture = false }
         val epoch = sessionEpoch
+        _processing.value = "Reading sheet…"
         viewModelScope.launch {
-            if (!bypassBlur && rejectAsBlurry(bitmap)) { bitmap.recycle(); return@launch }
             _processing.value = "Reading sheet…"
             val result = try {
+                if (!bypassBlur && rejectAsBlurry(bitmap, epoch)) { bitmap.recycle(); return@launch }
                 withContext(Dispatchers.Default) {
                     singleCaptureProcessor.process(
                         bitmap, ctx, scoringStrategy, hints,
@@ -596,6 +774,7 @@ class ScannerViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 android.util.Log.e("AutoCapture", "PIPELINE ERROR", e)
+                bitmap.recycle()
                 if (epoch != sessionEpoch) return@launch
                 _processing.value = null
                 toast("Scan failed — reposition and try again")
@@ -603,7 +782,7 @@ class ScannerViewModel @Inject constructor(
                 _rearmCapture.emit(Unit)
                 return@launch
             }
-            if (epoch != sessionEpoch) return@launch
+            if (epoch != sessionEpoch) { bitmap.recycle(); return@launch }
             _processing.value = null
             android.util.Log.d("AutoCapture", "PROCESSING DONE — result:$result")
             when (result) {
@@ -636,22 +815,21 @@ class ScannerViewModel @Inject constructor(
                     }
                 }
                 is SingleCaptureProcessor.Result.Recapture -> {
+                    bitmap.recycle()
                     if (result.reason.startsWith("BLURRY")) {
-                        blurRecaptureCount++
-                        android.util.Log.w("AutoCapture", "BLURRY retake ${blurRecaptureCount}/$blurBudget — ${result.reason}")
-                        if (blurRecaptureCount > blurBudget) {
-                            _blurRetryExhausted.value = true
-                            toast("Still blurry — tap “Capture anyway” to use this shot")
-                        } else {
-                            toast("Too blurry — hold steady and wait for focus")
-                        }
+                        handleBlurFailure()
                     } else {
                         registerSingleFailure()
                         toast("Adjusting — hold steady and keep all 6 markers in view")
+                        _rearmCapture.emit(Unit)
                     }
-                    _rearmCapture.emit(Unit)
                 }
                 is SingleCaptureProcessor.Result.Error -> {
+                    bitmap.recycle()
+                    if (result.reason.startsWith("Info zone:")) {
+                        _state.value = ScanSessionState.Error(result.reason.removePrefix("Info zone: "), phase = 1)
+                        return@launch
+                    }
                     registerSingleFailure()
                     toast("Couldn't read the sheet — flatten the paper and try again")
                     _rearmCapture.emit(Unit)
@@ -662,6 +840,8 @@ class ScannerViewModel @Inject constructor(
 
     // Persists the choice, resets counters, re-enters capture; keeps the same context.
     fun switchScanMode(mode: ScanMode) {
+        sessionEpoch++
+        _processing.value = null
         ScanSettings.setMode(appContext, mode)
         scanMode = mode
         _scanModeFlow.value = mode
@@ -701,7 +881,7 @@ class ScannerViewModel @Inject constructor(
 
     // When saving is on (and a folder is set), encode the success frame to JPEG immediately on
     // a background thread and recycle the bitmap, so only one frame is ever in memory and the
-    // persist path just writes a few KB. No-op (and bitmap left to GC, as before) otherwise.
+    // persist path just writes encoded bytes. Release unused captures immediately.
     private fun holdRawCaptureIfEnabled(bitmap: Bitmap) {
         if (ScanSettings.isSaveRawImages(appContext) && ScanSettings.getRawImageTreeUri(appContext) != null) {
             pendingRawEncode?.cancel()
@@ -717,6 +897,8 @@ class ScannerViewModel @Inject constructor(
                     bitmap.recycle()
                 }
             }
+        } else {
+            bitmap.recycle()
         }
     }
 
@@ -737,12 +919,12 @@ class ScannerViewModel @Inject constructor(
         }
     }
 
-    // Excludes the record being replaced. Empty unless studentId is a clean 6-digit
-    // read, so a misread never raises a spurious duplicate warning.
+    // Include legacy numeric scans only when the roster match is unambiguous.
     private suspend fun findActiveDuplicates(studentId: String, examId: Long): List<Long> {
-        if (studentId.length != 6 || !studentId.all { it.isDigit() }) return emptyList()
-        return scanResultRepository.getActiveByStudentAndExam(studentId, examId)
+        val ids = StudentIdMatcher.duplicateQueryIds(studentId, currentContext?.students.orEmpty())
+        return ids.flatMap { scanResultRepository.getActiveByStudentAndExam(it, examId) }
             .map { it.id }
+            .distinct()
             .filter { it != replaceResultId }
     }
 
@@ -750,6 +932,12 @@ class ScannerViewModel @Inject constructor(
     // normal save keeps them. replaceResultId is always honored.
     private fun persistPendingResult(trashDuplicates: Boolean = false) {
         val pending = pendingScanResult ?: return
+        val owner = sessionOwnerUid
+        if (owner == null || runCatching { signedInOwner() }.getOrNull() != owner) {
+            pendingScanResult = null
+            clearPendingRawCapture()
+            return
+        }
         pendingScanResult = null
         val replacing = replaceResultId
         replaceResultId = null
@@ -770,6 +958,7 @@ class ScannerViewModel @Inject constructor(
         }
         viewModelScope.launch {
             try {
+                requireOwner(owner)
                 scanResultRepository.insert(pending)
                 // Retire the replaced paper and/or chosen duplicates so stats don't double-count.
                 val toTrash = (listOfNotNull(replacing) + dupes).distinct()
@@ -803,6 +992,7 @@ class ScannerViewModel @Inject constructor(
         }
         recaptureCount = 0
         currentScannedInfo = null
+        resetBlurState()
         _captureProgress.value = 0f
         val ctx = activeContext
         if (ctx != null) {
@@ -813,12 +1003,15 @@ class ScannerViewModel @Inject constructor(
     }
 
     fun endSession() {
+        sessionLoadJob?.cancel()
         autoAdvanceJob?.cancel()
         // Invalidate any in-flight read and clear the "Reading…" overlay so a result that
         // lands after this can't flip the UI back into the ended session.
         sessionEpoch++
+        resetBlurState()
         _processing.value = null
         persistPendingResult()
+        sessionOwnerUid = null
         replaceResultId = null
         pendingDuplicateIds = emptyList()
         clearPendingMismatchBitmap()
@@ -832,6 +1025,7 @@ class ScannerViewModel @Inject constructor(
     }
 
     fun dismissError() {
+        resetBlurState()
         val ctx = activeContext
         _state.value = if (ctx != null)
             initialCaptureState(ctx)
@@ -862,16 +1056,28 @@ class ScannerViewModel @Inject constructor(
             return
         }
         _state.value = ScanSessionState.Loading
-        viewModelScope.launch {
+        sessionLoadJob?.cancel()
+        val epoch = ++sessionEpoch
+        sessionLoadJob = viewModelScope.launch {
             val ctx = try {
-                buildScanContext(newSubject, newExamId)
+                val owner = signedInOwner()
+                check(owner == sessionOwnerUid) { "Your account changed. Open the session again." }
+                val saved = withContext(Dispatchers.IO) { offlineStore.list(owner) }
+                    .flatMap { it.contexts }.firstOrNull { it.subject == newSubject && it.examId == newExamId }
+                val context = saved?.copy(clusterId = null, clusterName = null)
+                    ?: withTimeout(30_000) { buildScanContext(newSubject, newExamId, serverOnly = true) }
+                requireOwner(owner)
+                context
             } catch (e: Exception) {
+                if (e is CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
+                if (epoch != sessionEpoch) return@launch
                 _state.value = ScanSessionState.Error(
                     reason = e.message ?: "Failed to switch exam",
                     phase = 2
                 )
                 return@launch
             }
+            if (epoch != sessionEpoch) return@launch
             currentContext = ctx
             activeContext = ctx
             _activeSubject.value = ctx.subject
@@ -886,6 +1092,7 @@ class ScannerViewModel @Inject constructor(
         val info = currentScannedInfo ?: run { resolveSubjectMismatch_rescan(); return }
         val hints = pendingMismatchHints
         val singleMode = scanMode == ScanMode.SINGLE
+        val epoch = sessionEpoch
         _state.value = ScanSessionState.Loading
         viewModelScope.launch {
             _processing.value = "Scoring answers…"
@@ -922,11 +1129,13 @@ class ScannerViewModel @Inject constructor(
                     }
                 }
             } catch (e: Exception) {
+                if (epoch != sessionEpoch) return@launch
                 android.util.Log.e("AutoCapture", "PIPELINE ERROR (rescore)", e)
                 _processing.value = null
                 failRescore("Couldn't score this sheet — re-scan it")
                 return@launch
             }
+            if (epoch != sessionEpoch) return@launch
             _processing.value = null
             if (scanResult != null && answerKey != null) {
                 clearPendingMismatchBitmap()
